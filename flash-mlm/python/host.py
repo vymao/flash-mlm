@@ -13,6 +13,8 @@ def flash_attn_mlm(
     v_cache: torch.Tensor,
     context_len: int,
     scale: float,
+    is_mla: bool = False,
+    context_batch_size: int | None = None,
     cu_seqlens_q: torch.Tensor | None = None,
     cu_seqlens_kv: torch.Tensor | None = None,
     block_m: int = 64,
@@ -49,6 +51,11 @@ def flash_attn_mlm(
     if context_len < 0 or context_len > c:
         raise ValueError("context_len must be in [0, k_cache.shape[2]]")
 
+    if context_batch_size is None:
+        context_batch_size = bc
+    if context_batch_size < 1:
+        raise ValueError("context_batch_size must be >= 1")
+
     if d not in (16, 32, 64, 128, 256):
         raise ValueError("HEAD_DIM must be one of {16, 32, 64, 128, 256}")
 
@@ -76,12 +83,14 @@ def flash_attn_mlm(
         k_cache,
         v_cache,
         b,
+        context_batch_size,
         h,
         context_len,
         scale,
         n,
         cu_seqlens_q,
         cu_seqlens_kv,
+        is_mla=is_mla,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=d,

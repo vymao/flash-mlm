@@ -68,7 +68,7 @@ def _mlm_main_kernel(
     seq_len,
     cu_seqlens_q,
     cu_seqlens_kv,
-    is_mla,
+    is_mla: tl.constexpr,
     BLOCK_M: tl.constexpr,  # K/V
     BLOCK_N: tl.constexpr,  # Query
     HEAD_DIM: tl.constexpr,
@@ -77,9 +77,6 @@ def _mlm_main_kernel(
     off_hz = tl.program_id(1)
     batch_idx = off_hz // num_heads
     head_idx = off_hz % num_heads
-
-    is_mla_i = is_mla.to(tl.int32)
-    not_mla_i = 1 - is_mla_i
 
     multi_batch_context = context_batch_size > 1
 
@@ -109,10 +106,10 @@ def _mlm_main_kernel(
         block_shape=[BLOCK_N, HEAD_DIM],
     )
 
-    # Cache dimensions. Only one of the two will be non-zero.
-    standard_y_dim_context = (context_batch_size * num_heads * context_len) * not_mla_i
-    mla_y_dim_context = context_batch_size * context_len * is_mla_i
-    y_dim_context = standard_y_dim_context + mla_y_dim_context
+    if is_mla:
+        y_dim_context = context_batch_size * context_len
+    else:
+        y_dim_context = context_batch_size * num_heads * context_len
     desc_k_cache = _maybe_make_tensor_desc(
         desc_k_cache,
         shape=[y_dim_context, HEAD_DIM],
@@ -133,22 +130,16 @@ def _mlm_main_kernel(
     start_block_q = start_block_q * BLOCK_N
     offset_y = batch_idx * (seq_len * num_heads) + head_idx * seq_len
 
-    # Context offset depends on if batch size is 1 or not. Only one of the two will be non-zero.
-    standard_context_batch_offset = (
-        multi_batch_context * (batch_idx * num_heads * context_len) * not_mla_i
-    )
-    mla_context_batch_offset = (
-        multi_batch_context * (batch_idx * context_len) * is_mla_i
-    )
-
-    # Head offset needed for non-MLA.
-    standard_context_head_offset = (head_idx * context_len) * not_mla_i
-
-    offset_y_context = (
-        standard_context_batch_offset
-        + mla_context_batch_offset
-        + standard_context_head_offset
-    )
+    # Context offsets differ between standard per-head KV cache and MLA shared cache.
+    if is_mla:
+        context_batch_offset = multi_batch_context * (batch_idx * context_len)
+        context_head_offset = 0
+    else:
+        context_batch_offset = multi_batch_context * (
+            batch_idx * num_heads * context_len
+        )
+        context_head_offset = head_idx * context_len
+    offset_y_context = context_batch_offset + context_head_offset
 
     q_start_offsets = start_block_q + tl.arange(0, BLOCK_N)
     Q_block = desc_q.load([offset_y + start_block_q, 0])

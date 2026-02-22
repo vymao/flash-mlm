@@ -1,12 +1,7 @@
 import triton
 import triton.language as tl
 
-
-@triton.jit
-def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
-    if isinstance(desc_or_ptr, tl.tensor_descriptor):
-        return desc_or_ptr
-    return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
+from python.utils import _maybe_make_tensor_desc
 
 
 @triton.jit
@@ -66,10 +61,14 @@ def _mlm_main_kernel(
     desc_k_cache,
     desc_v_cache,
     batch_size,
+    context_batch_size,
     num_heads,
     context_len,
     scale,
     seq_len,
+    cu_seqlens_q,
+    cu_seqlens_kv,
+    is_mla,
     BLOCK_M: tl.constexpr,  # K/V
     BLOCK_N: tl.constexpr,  # Query
     HEAD_DIM: tl.constexpr,
@@ -78,6 +77,11 @@ def _mlm_main_kernel(
     off_hz = tl.program_id(1)
     batch_idx = off_hz // num_heads
     head_idx = off_hz % num_heads
+
+    is_mla_i = is_mla.to(tl.int32)
+    not_mla_i = 1 - is_mla_i
+
+    multi_batch_context = context_batch_size > 1
 
     y_dim = batch_size * num_heads * seq_len
     desc_q = _maybe_make_tensor_desc(
@@ -105,7 +109,10 @@ def _mlm_main_kernel(
         block_shape=[BLOCK_N, HEAD_DIM],
     )
 
-    y_dim_context = batch_size * num_heads * context_len
+    # Cache dimensions. Only one of the two will be non-zero.
+    standard_y_dim_context = (context_batch_size * num_heads * context_len) * not_mla_i
+    mla_y_dim_context = context_batch_size * context_len * is_mla_i
+    y_dim_context = standard_y_dim_context + mla_y_dim_context
     desc_k_cache = _maybe_make_tensor_desc(
         desc_k_cache,
         shape=[y_dim_context, HEAD_DIM],
@@ -125,7 +132,23 @@ def _mlm_main_kernel(
     # Get the corresponding pointers for the block edges for query
     start_block_q = start_block_q * BLOCK_N
     offset_y = batch_idx * (seq_len * num_heads) + head_idx * seq_len
-    offset_y_context = batch_idx * (context_len * num_heads) + head_idx * context_len
+
+    # Context offset depends on if batch size is 1 or not. Only one of the two will be non-zero.
+    standard_context_batch_offset = (
+        multi_batch_context * (batch_idx * num_heads * context_len) * not_mla_i
+    )
+    mla_context_batch_offset = (
+        multi_batch_context * (batch_idx * context_len) * is_mla_i
+    )
+
+    # Head offset needed for non-MLA.
+    standard_context_head_offset = (head_idx * context_len) * not_mla_i
+
+    offset_y_context = (
+        standard_context_batch_offset
+        + mla_context_batch_offset
+        + standard_context_head_offset
+    )
 
     q_start_offsets = start_block_q + tl.arange(0, BLOCK_N)
     Q_block = desc_q.load([offset_y + start_block_q, 0])
@@ -135,7 +158,9 @@ def _mlm_main_kernel(
     l_i = tl.zeros([BLOCK_N], dtype=tl.float32)
     o_i = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
 
-    ##  Separate loops for cache and current sequence, for memory efficiency
+    # ============================================================
+    # Step 2: Compute Attention
+    # ============================================================
     # Cache
     o_i, l_i, m_i = _mlm_inner_attention(
         Q_block,

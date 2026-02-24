@@ -36,6 +36,49 @@ def _reference_varlen_attention(q, k, v, lengths, scale, is_mla):
     return out
 
 
+def _reference_varlen_attention_with_cache(
+    q,
+    k,
+    v,
+    lengths_q,
+    k_cache,
+    v_cache,
+    cu_seqlens_kv,
+    scale,
+    is_mla,
+):
+    """Reference for per-batch varlen attention with packed cache + current tokens."""
+    bsz, n_heads, _, _ = q.shape
+    total_context_len = int(cu_seqlens_kv[-1].item())
+    out = torch.zeros_like(q)
+    for b in range(bsz):
+        Lq = int(lengths_q[b].item())
+        if Lq == 0:
+            continue
+        c_start = int(cu_seqlens_kv[b].item())
+        c_end = int(cu_seqlens_kv[b + 1].item())
+        for h in range(n_heads):
+            q_bh = q[b, h, :Lq, :]
+            if is_mla:
+                k_main = k[b, 0, :Lq, :]
+                v_main = k_main
+                k_ctx = k_cache[c_start:c_end, :]
+                v_ctx = k_ctx
+            else:
+                k_main = k[b, h, :Lq, :]
+                v_main = v[b, h, :Lq, :]
+                row_offset = h * total_context_len
+                k_ctx = k_cache[row_offset + c_start : row_offset + c_end, :]
+                v_ctx = v_cache[row_offset + c_start : row_offset + c_end, :]
+
+            k_all = torch.cat([k_ctx, k_main], dim=0)
+            v_all = torch.cat([v_ctx, v_main], dim=0)
+            logits = torch.matmul(q_bh, k_all.transpose(0, 1)) * scale
+            probs = torch.softmax(logits.float(), dim=-1).to(q.dtype)
+            out[b, h, :Lq, :] = torch.matmul(probs, v_all)
+    return out
+
+
 @pytest.mark.parametrize("is_mla", [False, True])
 def test_mlm_compressed_matches_reference(is_mla):
     if not torch.cuda.is_available():
@@ -81,6 +124,68 @@ def test_mlm_compressed_matches_reference(is_mla):
     out = unpack_from_kernel(packed_out, q_meta, H=H)
 
     ref = _reference_varlen_attention(q, k, v, lengths, scale, is_mla=is_mla)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=0)
+
+
+@pytest.mark.parametrize("is_mla", [False, True])
+def test_mlm_compressed_matches_reference_with_cache(is_mla):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    torch.manual_seed(1)
+    B, H, N, D = 2, 3, 48, 64
+    lengths = torch.tensor([48, 37], device=DEVICE, dtype=torch.int32)
+    context_lengths = torch.tensor([13, 9], device=DEVICE, dtype=torch.int32)
+    scale = 0.5
+
+    q = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    k = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    v = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+
+    cu_seqlens_kv = torch.zeros(B + 1, device=DEVICE, dtype=torch.int32)
+    cu_seqlens_kv[1:] = context_lengths.cumsum(0)
+    total_context_len = int(cu_seqlens_kv[-1].item())
+
+    if is_mla:
+        k_cache = torch.randn(
+            (total_context_len, D), device=DEVICE, dtype=torch.float16
+        )
+        v_cache = torch.randn_like(k_cache)
+    else:
+        k_cache = torch.randn(
+            (H * total_context_len, D), device=DEVICE, dtype=torch.float16
+        )
+        v_cache = torch.randn_like(k_cache)
+
+    q_meta = build_pack_metadata(lengths, N, block_n=32)
+    packed_out = flash_attn_mlm_compressed(
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        num_heads=H,
+        total_context_len=total_context_len,
+        cu_seqlens_kv=cu_seqlens_kv,
+        scale=scale,
+        q_meta=q_meta,
+        is_mla=is_mla,
+        block_m=32,
+        block_n=32,
+    )
+    out = unpack_from_kernel(packed_out, q_meta, H=H)
+
+    ref = _reference_varlen_attention_with_cache(
+        q,
+        k,
+        v,
+        lengths,
+        k_cache,
+        v_cache,
+        cu_seqlens_kv,
+        scale,
+        is_mla,
+    )
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=0)
 
 

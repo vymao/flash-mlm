@@ -1,7 +1,7 @@
 import triton
 import triton.language as tl
 
-from python.utils import _maybe_make_tensor_desc
+from python.kernel_utils import _maybe_make_tensor_desc
 
 
 @triton.jit
@@ -20,12 +20,16 @@ def _mlm_inner_attention(
     K_END,
     BLOCK_M: tl.constexpr,  # K/V
     HEAD_DIM: tl.constexpr,
+    IS_MLA: tl.constexpr,
 ):
     for block_start in tl.range(K_START, K_END, BLOCK_M):
         kv_start_offsets = block_start + tl.arange(0, BLOCK_M)
 
         K_block = desc_k.load([offset_y + block_start, 0])
-        V_block = desc_v.load([offset_y + block_start, 0])
+        if IS_MLA:
+            V_block = K_block
+        else:
+            V_block = desc_v.load([offset_y + block_start, 0])
 
         # Compute attention
         attn = tl.dot(Q_block, tl.trans(K_block)) * scale
@@ -168,6 +172,7 @@ def _mlm_main_kernel(
         context_len,
         BLOCK_M,
         HEAD_DIM,
+        is_mla,
     )
 
     # Main
@@ -186,6 +191,7 @@ def _mlm_main_kernel(
         seq_len,
         BLOCK_M,
         HEAD_DIM,
+        is_mla,
     )
 
     l_safe = tl.where(l_i > 0, l_i, 1.0)
@@ -223,28 +229,32 @@ def _mlm_compressed_kernel(
         batch_ids_q + start_block_q
     )  # Indexes start_block_q into batch_ids_q
 
-    y_dim = num_heads * total_q_len
+    y_dim_qo = num_heads * total_q_len
+    if is_mla:
+        y_dim_kv_main = total_q_len
+    else:
+        y_dim_kv_main = num_heads * total_q_len
     desc_q = _maybe_make_tensor_desc(
         desc_q,
-        shape=[y_dim, HEAD_DIM],
+        shape=[y_dim_qo, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_N, HEAD_DIM],
     )
     desc_k = _maybe_make_tensor_desc(
         desc_k,
-        shape=[y_dim, HEAD_DIM],
+        shape=[y_dim_kv_main, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_M, HEAD_DIM],
     )
     desc_v = _maybe_make_tensor_desc(
         desc_v,
-        shape=[y_dim, HEAD_DIM],
+        shape=[y_dim_kv_main, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_M, HEAD_DIM],
     )
     desc_o = _maybe_make_tensor_desc(
         desc_o,
-        shape=[y_dim, HEAD_DIM],
+        shape=[y_dim_qo, HEAD_DIM],
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_N, HEAD_DIM],
     )
@@ -297,7 +307,10 @@ def _mlm_compressed_kernel(
     kv_context_len = kv_context_end - kv_context_start
 
     kv_context_start_offset = kv_context_start + context_head_offset
-    kv_main_start_offset = q_start + q_head_offset
+    if is_mla:
+        kv_main_start_offset = q_start
+    else:
+        kv_main_start_offset = q_start + q_head_offset
 
     # ============================================================
     # Step 3: Compute Attention
@@ -322,6 +335,7 @@ def _mlm_compressed_kernel(
         kv_context_len,
         BLOCK_M,
         HEAD_DIM,
+        is_mla,
     )
 
     # Main
@@ -340,6 +354,7 @@ def _mlm_compressed_kernel(
         q_len,
         BLOCK_M,
         HEAD_DIM,
+        is_mla,
     )
 
     l_safe = tl.where(l_i > 0, l_i, 1.0)

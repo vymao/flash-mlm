@@ -213,6 +213,7 @@ def _mlm_compressed_kernel(
     scale,
     total_q_len,  # Length of the packed query, across batches, per head
     batch_ids_q,  # Per tile batch index
+    q_tile_starts_q,  # Per tile packed-query start offset
     cu_seqlens_q,  # Cumulative sequence lengths for query, per batch, per head
     cu_seqlens_kv,  # Cumulative sequence lengths for key/value, per batch, per head
     is_mla: tl.constexpr,
@@ -220,14 +221,14 @@ def _mlm_compressed_kernel(
     BLOCK_N: tl.constexpr,  # Query
     HEAD_DIM: tl.constexpr,
 ):
-    start_block_q = tl.program_id(0)  # Concatenated sequence dimension (batch-wise)
+    out_ptr = desc_o
+    tile_idx = tl.program_id(0)  # Per-batch accumulated tile index
     head_idx = tl.program_id(1)  # Head dimension
 
     ## Parameters
     # Load and get batch index and start offset for query
-    batch_idx = tl.load(
-        batch_ids_q + start_block_q
-    )  # Indexes start_block_q into batch_ids_q
+    batch_idx = tl.load(batch_ids_q + tile_idx)
+    start_block_q = tl.load(q_tile_starts_q + tile_idx)
 
     y_dim_qo = num_heads * total_q_len
     if is_mla:
@@ -252,12 +253,6 @@ def _mlm_compressed_kernel(
         strides=[HEAD_DIM, 1],
         block_shape=[BLOCK_M, HEAD_DIM],
     )
-    desc_o = _maybe_make_tensor_desc(
-        desc_o,
-        shape=[y_dim_qo, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N, HEAD_DIM],
-    )
 
     if is_mla:
         y_dim_context = total_context_len
@@ -280,7 +275,6 @@ def _mlm_compressed_kernel(
     # Step 1: Load Q block — stays in registers for the entire loop
     # ============================================================
     # Load per-sequence token offset
-    start_block_q = start_block_q * BLOCK_N
     q_head_offset = head_idx * total_q_len
     q_tile_block_offset = start_block_q + q_head_offset
 
@@ -359,4 +353,8 @@ def _mlm_compressed_kernel(
 
     l_safe = tl.where(l_i > 0, l_i, 1.0)
     o_i = o_i / l_safe[:, None]
-    desc_o.store([q_tile_block_offset, 0], o_i)
+    q_valid = (q_start_offsets >= 0) & (q_start_offsets < q_len)
+    o_row_offsets = q_tile_block_offset + tl.arange(0, BLOCK_N)
+    o_col_offsets = tl.arange(0, HEAD_DIM)
+    out_ptrs = out_ptr + o_row_offsets[:, None] * HEAD_DIM + o_col_offsets[None, :]
+    tl.store(out_ptrs, o_i, mask=q_valid[:, None])

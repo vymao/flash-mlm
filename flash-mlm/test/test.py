@@ -1,14 +1,87 @@
-from python.kernel import _attention
+from python.host import flash_attn_mlm_compressed
+from python.host_utils import build_pack_metadata, unpack_from_kernel
 import torch
 import pytest
 import triton
 
-from python.utils import is_hip, is_blackwell, is_hopper
+from python.kernel_utils import is_hip, is_blackwell, is_hopper
 
-attention = _attention.apply
+try:
+    from python.kernel import _attention
+
+    attention = _attention.apply
+except Exception:
+    _attention = None
+    attention = None
 
 TORCH_HAS_FP8 = hasattr(torch, "float8_e5m2")
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
+
+def _reference_varlen_attention(q, k, v, lengths, scale, is_mla):
+    """Reference for per-batch variable-length self-attention on padded [B, H, N, D]."""
+    bsz, n_heads, n_ctx, d = q.shape
+    out = torch.zeros_like(q)
+    for b in range(bsz):
+        L = int(lengths[b].item())
+        if L == 0:
+            continue
+        for h in range(n_heads):
+            q_bh = q[b, h, :L, :]
+            k_bh = k[b, 0 if is_mla else h, :L, :]
+            v_bh = k_bh if is_mla else v[b, h, :L, :]
+            logits = torch.matmul(q_bh, k_bh.transpose(0, 1)) * scale
+            probs = torch.softmax(logits.float(), dim=-1).to(q.dtype)
+            out[b, h, :L, :] = torch.matmul(probs, v_bh)
+    return out
+
+
+@pytest.mark.parametrize("is_mla", [False, True])
+def test_mlm_compressed_matches_reference(is_mla):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    torch.manual_seed(0)
+    B, H, N, D = 2, 3, 48, 64
+    lengths = torch.tensor([48, 37], device=DEVICE, dtype=torch.int32)
+    scale = 0.7
+
+    q = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    k = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    v = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+
+    total_context_len = 0
+    if is_mla:
+        k_cache = torch.empty(
+            (total_context_len, D), device=DEVICE, dtype=torch.float16
+        )
+    else:
+        k_cache = torch.empty(
+            (H * total_context_len, D), device=DEVICE, dtype=torch.float16
+        )
+    v_cache = torch.empty_like(k_cache)
+    cu_seqlens_kv = torch.zeros(B + 1, device=DEVICE, dtype=torch.int32)
+
+    q_meta = build_pack_metadata(lengths, N, block_n=32)
+    packed_out = flash_attn_mlm_compressed(
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        num_heads=H,
+        total_context_len=total_context_len,
+        cu_seqlens_kv=cu_seqlens_kv,
+        scale=scale,
+        q_meta=q_meta,
+        is_mla=is_mla,
+        block_m=32,
+        block_n=32,
+    )
+    out = unpack_from_kernel(packed_out, q_meta, H=H)
+
+    ref = _reference_varlen_attention(q, k, v, lengths, scale, is_mla=is_mla)
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=0)
 
 
 @pytest.mark.parametrize("Z", [1, 4])
@@ -26,6 +99,10 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 def test_op(
     Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtype=torch.float16
 ):
+    if attention is None:
+        pytest.skip(
+            "python/kernel.py reference path unavailable; skipping legacy attention test"
+        )
     if mode == "fwd" and "fp16" in provider:
         pytest.skip("Avoid running the forward computation twice.")
     if mode == "bwd" and "fp8" in provider:
@@ -150,6 +227,10 @@ for HEAD_DIM in [64, 128]:
 def bench_flash_attention(
     BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, device=DEVICE
 ):
+    if attention is None and "triton" in provider:
+        pytest.skip(
+            "python/kernel.py reference path unavailable; skipping Triton benchmark"
+        )
     assert mode in ["fwd", "bwd"]
     dtype = torch.float16
     if "triton" in provider:

@@ -2,18 +2,12 @@ import torch
 
 import triton
 
-from python.host_utils import PackMetadata, build_pack_metadata, pack_for_kernel
+from python.host_utils import (
+    PackMetadata,
+    pack_for_kernel,
+    pad_packed_main_tensors_for_mlm_compressed,
+)
 from python.mlm_kernel import _mlm_compressed_kernel, _mlm_main_kernel
-
-
-def _build_batch_ids_q_from_cu_seqlens(cu_seqlens_q: torch.Tensor, block_n: int):
-    lengths = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-    tiles_per_batch = torch.div(lengths + (block_n - 1), block_n, rounding_mode="floor")
-    batch_ids = torch.repeat_interleave(
-        torch.arange(lengths.numel(), device=cu_seqlens_q.device, dtype=torch.int32),
-        tiles_per_batch.to(torch.int64),
-    )
-    return batch_ids.contiguous()
 
 
 def flash_attn_mlm(
@@ -117,14 +111,10 @@ def flash_attn_mlm_compressed(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     num_heads: int,
-    total_q_len: int | None,
+    q_meta: PackMetadata,
     total_context_len: int,
-    batch_ids_q: torch.Tensor | None,
-    cu_seqlens_q: torch.Tensor | None,
     cu_seqlens_kv: torch.Tensor,
     scale: float,
-    q_lengths: torch.Tensor | None = None,
-    q_meta: PackMetadata | None = None,
     is_mla: bool = False,
     context_batch_size: int | None = None,
     block_m: int = 64,
@@ -137,6 +127,28 @@ def flash_attn_mlm_compressed(
       k_cache, v_cache:
         - MLA: [total_context_len, D]
         - non-MLA: [H * total_context_len, D]
+
+    Args:
+        q: Query tensor with padded layout [B, H, N, D].
+        k: Key tensor with padded layout [B, H, N, D].
+        v: Value tensor with padded layout [B, H, N, D].
+        k_cache: Packed cache K tensor.
+            - MLA: [total_context_len, D]
+            - non-MLA: [H * total_context_len, D]
+        v_cache: Packed cache V tensor with same shape as k_cache.
+        num_heads: Number of attention heads (H).
+        q_meta: Precomputed packing metadata for q/k/v.
+        total_context_len: Total packed context token count across context batches.
+        cu_seqlens_kv: Cumulative context lengths [context_batch_size+1].
+        scale: Attention scaling factor applied to QK logits.
+        is_mla: Whether to run in MLA latent mode (shared K/V latent layout).
+        context_batch_size: Number of context batches represented by cu_seqlens_kv.
+            If None, inferred from cu_seqlens_kv.
+        block_m: K/V tile size for the Triton kernel.
+        block_n: Q tile size for the Triton kernel.
+
+    Returns:
+        Packed output tensor with shape [H * total_q_len, D].
     """
 
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
@@ -158,37 +170,37 @@ def flash_attn_mlm_compressed(
     ):
         raise ValueError("All tensors must be CUDA tensors")
 
-    if q_meta is None:
-        if q_lengths is None:
-            raise ValueError("q_lengths or q_meta is required")
-        q_lengths = q_lengths.to(device=q.device)
-        q_meta = build_pack_metadata(q_lengths, n)
-    elif q_meta.B != b or q_meta.N != n:
+    if q_meta.B != b or q_meta.N != n:
         raise ValueError("q_meta shape metadata does not match q/k/v padded shape")
 
-    q, cu_q = pack_for_kernel(q, q_meta, flatten_for_kernel=True)
-    k, _ = pack_for_kernel(k, q_meta, flatten_for_kernel=True)
-    v, _ = pack_for_kernel(v, q_meta, flatten_for_kernel=True)
-
-    if total_q_len is None:
-        total_q_len = q_meta.total_tokens
-    elif total_q_len != q_meta.total_tokens:
-        raise ValueError("total_q_len does not match packed q_lengths")
-
-    if cu_seqlens_q is None:
-        cu_seqlens_q = cu_q
+    q = pack_for_kernel(q, q_meta, flatten_for_kernel=True)
+    if is_mla:
+        k = pack_for_kernel(k[:, :1, :, :], q_meta, flatten_for_kernel=True)
+        v = k
     else:
-        cu_seqlens_q = cu_seqlens_q.to(device=q.device, dtype=torch.int32)
-        if cu_seqlens_q.numel() != cu_q.numel():
-            raise ValueError("cu_seqlens_q length does not match q_lengths")
+        k = pack_for_kernel(k, q_meta, flatten_for_kernel=True)
+        v = pack_for_kernel(v, q_meta, flatten_for_kernel=True)
 
-    if batch_ids_q is None and cu_seqlens_q is not None:
-        batch_ids_q = _build_batch_ids_q_from_cu_seqlens(cu_seqlens_q, block_n)
+    total_q_len_unpadded = q_meta.total_tokens
 
-    if total_q_len is None or batch_ids_q is None or cu_seqlens_q is None:
-        raise ValueError(
-            "total_q_len, batch_ids_q, and cu_seqlens_q are required for packed inputs"
-        )
+    if q_meta.batch_ids_block_n != block_n:
+        raise ValueError("q_meta was built with different block_n")
+    cu_seqlens_q = q_meta.cu_seqlens
+
+    q, k, v, total_q_len = pad_packed_main_tensors_for_mlm_compressed(
+        q,
+        k,
+        v,
+        num_heads=num_heads,
+        is_mla=is_mla,
+        total_q_len_unpadded=total_q_len_unpadded,
+        cu_seqlens_q=cu_seqlens_q,
+        block_m=block_m,
+        block_n=block_n,
+    )
+
+    batch_ids_q = q_meta.batch_ids_q
+    q_tile_starts_q = q_meta.q_tile_starts_q
 
     if not (batch_ids_q.is_cuda and cu_seqlens_q.is_cuda):
         raise ValueError("batch_ids_q and cu_seqlens_q must be CUDA tensors")
@@ -203,9 +215,16 @@ def flash_attn_mlm_compressed(
     if total_q_len < 0 or total_context_len < 0:
         raise ValueError("total_q_len and total_context_len must be >= 0")
 
-    y_dim, d = q.shape
-    if y_dim != num_heads * total_q_len:
-        raise ValueError("q/k/v first dim must equal num_heads * total_q_len")
+    y_dim_q, d = q.shape
+    if y_dim_q != num_heads * total_q_len:
+        raise ValueError("q first dim must equal num_heads * total_q_len")
+
+    expected_main_rows = total_q_len if is_mla else num_heads * total_q_len
+    if k.shape[0] != expected_main_rows or v.shape[0] != expected_main_rows:
+        raise ValueError(
+            "k/v first dim mismatch: expected "
+            f"{expected_main_rows} rows for is_mla={is_mla}"
+        )
 
     if k_cache.shape[1] != d:
         raise ValueError("k_cache/v_cache second dim must match q/k/v head_dim")
@@ -234,11 +253,13 @@ def flash_attn_mlm_compressed(
     if context_batch_size + 1 > cu_seqlens_kv.numel():
         raise ValueError("context_batch_size is incompatible with cu_seqlens_kv length")
 
-    num_q_tiles = triton.cdiv(total_q_len, block_n)
-    if batch_ids_q.ndim != 1 or batch_ids_q.numel() < num_q_tiles:
+    num_q_tiles = int(q_tile_starts_q.numel())
+    if batch_ids_q.ndim != 1 or batch_ids_q.numel() != num_q_tiles:
         raise ValueError(
-            "batch_ids_q must be rank-1 with at least cdiv(total_q_len, block_n) entries"
+            "batch_ids_q must be rank-1 with exactly one entry per query tile"
         )
+    if q_tile_starts_q.ndim != 1:
+        raise ValueError("q_tile_starts_q must be rank-1")
 
     q = q.contiguous()
     k = k.contiguous()
@@ -246,6 +267,7 @@ def flash_attn_mlm_compressed(
     k_cache = k_cache.contiguous()
     v_cache = v_cache.contiguous()
     batch_ids_q = batch_ids_q.contiguous()
+    q_tile_starts_q = q_tile_starts_q.contiguous()
     cu_seqlens_q = cu_seqlens_q.contiguous()
     cu_seqlens_kv = cu_seqlens_kv.contiguous()
 
@@ -265,6 +287,7 @@ def flash_attn_mlm_compressed(
         scale,
         total_q_len,
         batch_ids_q,
+        q_tile_starts_q,
         cu_seqlens_q,
         cu_seqlens_kv,
         is_mla=is_mla,
@@ -272,5 +295,12 @@ def flash_attn_mlm_compressed(
         BLOCK_N=block_n,
         HEAD_DIM=d,
     )
+
+    if total_q_len != total_q_len_unpadded:
+        out = (
+            out.view(num_heads, total_q_len, d)[:, :total_q_len_unpadded, :]
+            .reshape(num_heads * total_q_len_unpadded, d)
+            .contiguous()
+        )
 
     return out

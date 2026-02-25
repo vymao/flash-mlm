@@ -1,7 +1,19 @@
 import triton
 import triton.language as tl
 
-from python.kernel_utils import _maybe_make_tensor_desc
+from python.kernel_utils import _maybe_make_tensor_desc, is_hip
+
+
+if is_hip():
+    _MLM_NUM_STAGES_OPTIONS = [1]
+else:
+    _MLM_NUM_STAGES_OPTIONS = [2, 3, 4]
+
+_MLM_COMPRESSED_AUTOTUNE_CONFIGS = [
+    triton.Config({}, num_stages=s, num_warps=w)
+    for s in _MLM_NUM_STAGES_OPTIONS
+    for w in [2, 4, 8]
+]
 
 
 @triton.jit
@@ -22,6 +34,7 @@ def _mlm_inner_attention(
     HEAD_DIM: tl.constexpr,
     IS_MLA: tl.constexpr,
 ):
+    scale_log2 = scale * 1.4426950408889634  # 1 / ln(2)
     for block_start in tl.range(K_START, K_END, BLOCK_M):
         kv_start_offsets = block_start + tl.arange(0, BLOCK_M)
 
@@ -32,7 +45,7 @@ def _mlm_inner_attention(
             V_block = desc_v.load([offset_y + block_start, 0])
 
         # Compute attention
-        attn = tl.dot(Q_block, tl.trans(K_block)) * scale
+        attn = tl.dot(Q_block, tl.trans(K_block)) * scale_log2
 
         # Apply masking for out of bounds positions
         kv_valid = kv_start_offsets < K_END
@@ -43,8 +56,8 @@ def _mlm_inner_attention(
         max_val_block = tl.max(attn, axis=1)
         m_new = tl.maximum(m_i, max_val_block)
 
-        corrected_max = tl.exp(m_i - m_new)
-        adjusted_attn = tl.exp(attn - m_new[:, None])
+        corrected_max = tl.math.exp2(m_i - m_new)
+        adjusted_attn = tl.math.exp2(attn - m_new[:, None])
         l_i = l_i * corrected_max + tl.sum(adjusted_attn, axis=1)
 
         o_i = o_i * corrected_max[:, None] + tl.dot(
@@ -199,6 +212,10 @@ def _mlm_main_kernel(
     desc_o.store([offset_y + start_block_q, 0], o_i)
 
 
+@triton.autotune(
+    configs=_MLM_COMPRESSED_AUTOTUNE_CONFIGS,
+    key=["HEAD_DIM", "BLOCK_M", "BLOCK_N", "is_mla"],
+)
 @triton.jit
 def _mlm_compressed_kernel(
     desc_q,  # Assumes layout of (batch_size, num_heads, seq_len, head_dim)

@@ -1,6 +1,7 @@
 # All Python bytecode caches
 __pycache__/
 **/__pycache__*
+plots/
 
 # Optional: ignore compiled Python files too
 *.pyc

@@ -1,13 +1,13 @@
-from python.host import flash_attn_mlm_compressed
-from python.host_utils import build_pack_metadata, unpack_from_kernel
+from flash_mlm.host import flash_attn_mlm_compressed
+from flash_mlm.host_utils import build_pack_metadata, unpack_from_kernel
 import torch
 import pytest
 import triton
 
-from python.kernel_utils import is_hip, is_blackwell, is_hopper
+from flash_mlm.kernel_utils import is_hip, is_blackwell, is_hopper
 
 try:
-    from python.kernel import _attention
+    from flash_mlm.kernel import _attention
 
     attention = _attention.apply
 except Exception:

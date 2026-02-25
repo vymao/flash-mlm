@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from python.host_utils import (
+from flash_mlm.host_utils import (
     build_batch_ids_from_cu_seqlens,
     build_pack_metadata,
     build_q_tile_starts_from_cu_seqlens,

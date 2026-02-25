@@ -3,9 +3,9 @@ import math
 import torch
 import triton
 
-from python.host import flash_attn_mlm_compressed
-from python.host_utils import build_pack_metadata
-from python.kernel_utils import is_hip
+from flash_mlm.host import flash_attn_mlm_compressed
+from flash_mlm.host_utils import build_pack_metadata
+from flash_mlm.kernel_utils import is_hip
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 N_HEADS_DEFAULT = 32

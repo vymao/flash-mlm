@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from python.utils import (
+from flash_mlm.kernel_utils import (
     is_hopper,
     is_blackwell,
     is_hip,

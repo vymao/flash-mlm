@@ -1,7 +1,7 @@
 import triton
 import triton.language as tl
 
-from python.kernel_utils import _maybe_make_tensor_desc, is_hip
+from flash_mlm.kernel_utils import _maybe_make_tensor_desc, is_hip
 
 
 if is_hip():

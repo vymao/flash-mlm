@@ -13,7 +13,7 @@ from benchmark.common import (
     DEVICE,
     run_mlm_compressed_case,
 )  # noqa: E402
-from python.kernel_utils import is_hip  # noqa: E402
+from flash_mlm.kernel_utils import is_hip  # noqa: E402
 
 BATCH = 4
 PLOTS_DIR = Path("plots")

@@ -2,12 +2,12 @@ import torch
 
 import triton
 
-from python.host_utils import (
+from flash_mlm.host_utils import (
     PackMetadata,
     pack_for_kernel,
     pad_packed_main_tensors_for_mlm_compressed,
 )
-from python.mlm_kernel import _mlm_compressed_kernel, _mlm_main_kernel
+from flash_mlm.mlm_kernel import _mlm_compressed_kernel, _mlm_main_kernel
 
 
 def flash_attn_mlm(

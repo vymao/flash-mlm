@@ -66,18 +66,20 @@ def flash_attn_mlm(
 
     b, h, n, d = q.shape
     bc, hc, c, dc = k_cache.shape
-    if (bc, hc, dc) != (b, h, d):
-        raise ValueError("k_cache shape must be [B, H, C, D] matching q's B/H/D")
+    if (hc, dc) != (h, d):
+        raise ValueError("k_cache shape must have H/D matching q")
     if v_cache.shape != k_cache.shape:
         raise ValueError("v_cache shape must match k_cache shape")
-
-    if context_len < 0 or context_len > c:
-        raise ValueError("context_len must be in [0, k_cache.shape[2]]")
 
     if context_batch_size is None:
         context_batch_size = bc
     if context_batch_size < 1:
         raise ValueError("context_batch_size must be >= 1")
+    if bc not in (1, context_batch_size):
+        raise ValueError("k_cache batch dim must be 1 or match context_batch_size")
+
+    if context_len < 0 or context_len > c:
+        raise ValueError("context_len must be in [0, k_cache.shape[2]]")
 
     # Kept for API compatibility with compressed path / future varlen main path.
     _ = (cu_seqlens_q, cu_seqlens_kv)

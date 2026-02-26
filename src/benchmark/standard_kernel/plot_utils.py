@@ -41,15 +41,25 @@ def _plot_metric(
     plt.close(fig)
 
 
-def write_benchmark_bar_plots(rows: list[dict], *, context_len: int, plots_dir: Path):
+def write_benchmark_bar_plots(
+    rows: list[dict],
+    *,
+    mean_context_subseq_len: float,
+    query_batch_size: int,
+    plots_dir: Path,
+):
+    title_suffix = (
+        "mean_true_context_subseq_len="
+        f"{mean_context_subseq_len:.2f}, query_batch_size={query_batch_size}"
+    )
     _plot_metric(
         rows,
         standard_key="standard_ms",
         noncompressed_key="noncompressed_ms",
         compressed_key="compressed_ms",
         ylabel="Latency (ms)",
-        title=f"attention latency by section (context_len={context_len})",
-        out_path=plots_dir / f"mlm-threeway-latency-ctx{context_len}.png",
+        title=f"Attention latency by section ({title_suffix})",
+        out_path=plots_dir / "mlm-threeway-latency.png",
     )
     _plot_metric(
         rows,
@@ -57,6 +67,6 @@ def write_benchmark_bar_plots(rows: list[dict], *, context_len: int, plots_dir: 
         noncompressed_key="noncompressed_tflops",
         compressed_key="compressed_tflops",
         ylabel="Estimated TFLOPS",
-        title=f"attention TFLOPS by section (context_len={context_len})",
-        out_path=plots_dir / f"mlm-threeway-tflops-ctx{context_len}.png",
+        title=f"Attention TFLOPS by section ({title_suffix})",
+        out_path=plots_dir / "mlm-threeway-tflops.png",
     )

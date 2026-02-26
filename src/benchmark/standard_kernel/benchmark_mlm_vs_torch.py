@@ -1,5 +1,4 @@
 import argparse
-import math
 import sys
 from pathlib import Path
 
@@ -12,328 +11,15 @@ if str(_PARENT) not in sys.path:
     sys.path.insert(0, str(_PARENT))
 
 from flash_mlm.host import flash_attn_mlm, flash_attn_mlm_compressed  # noqa: E402
-from flash_mlm.host_utils import build_pack_metadata, unpack_from_kernel  # noqa: E402
+from flash_mlm.host_utils import unpack_from_kernel  # noqa: E402
+from benchmark_utils import (  # noqa: E402
+    _build_shared_inputs,
+    _estimate_tflops,
+    _reference_dense_attention_with_cache,
+    _reference_varlen_attention_with_cache,
+    _resolve_padded_len,
+)
 from utils.plot_utils import write_benchmark_bar_plots  # noqa: E402
-
-
-def _resolve_padded_len(active_len: int, max_len: int | None, name: str) -> int:
-    if max_len is None:
-        return active_len
-    if max_len < active_len:
-        raise ValueError(f"--max-len ({max_len}) must be >= {name} ({active_len})")
-    return max_len
-
-
-def _make_varlen_lengths(
-    batch_size: int,
-    max_len: int,
-    min_ratio: float,
-    max_ratio: float,
-    *,
-    device: torch.device,
-) -> torch.Tensor:
-    if batch_size < 1:
-        raise ValueError("batch_size must be >= 1")
-    if max_len < 1:
-        raise ValueError("max_len must be >= 1")
-    if batch_size == 1:
-        return torch.tensor([max_len], device=device, dtype=torch.int32)
-
-    ratios = torch.linspace(min_ratio, max_ratio, steps=batch_size, device=device)
-    return torch.clamp((ratios * max_len).to(torch.int32), min=1, max=max_len)
-
-
-def _sample_concatenated_context_lengths(
-    *,
-    context_batch_size: int,
-    context_subseq_len_active: int,
-    num_context_seqs_per_query: int,
-    kv_ratio_min: float,
-    kv_ratio_max: float,
-    device: torch.device,
-) -> torch.Tensor:
-    if context_subseq_len_active < 1:
-        return torch.zeros(context_batch_size, device=device, dtype=torch.int32)
-    if num_context_seqs_per_query == 1:
-        return _make_varlen_lengths(
-            context_batch_size,
-            context_subseq_len_active,
-            kv_ratio_min,
-            kv_ratio_max,
-            device=device,
-        )
-
-    subseq = _make_varlen_lengths(
-        context_batch_size * num_context_seqs_per_query,
-        context_subseq_len_active,
-        kv_ratio_min,
-        kv_ratio_max,
-        device=device,
-    ).view(context_batch_size, num_context_seqs_per_query)
-    totals = subseq.sum(dim=1)
-    max_total_context_len = context_subseq_len_active * num_context_seqs_per_query
-    return torch.clamp(totals, min=1, max=max_total_context_len).to(torch.int32)
-
-
-def _build_cu_seqlens(lengths: torch.Tensor) -> torch.Tensor:
-    cu = torch.zeros(lengths.numel() + 1, device=lengths.device, dtype=torch.int32)
-    cu[1:] = lengths.cumsum(dim=0)
-    return cu
-
-
-def _estimate_tflops(
-    lengths_q: torch.Tensor,
-    lengths_kv: torch.Tensor,
-    num_heads: int,
-    head_dim: int,
-    latency_ms: float,
-) -> float:
-    q = lengths_q.to(torch.float64)
-    if lengths_kv.numel() == 1:
-        kv_for_q = lengths_kv.expand_as(lengths_q)
-    elif lengths_kv.numel() == lengths_q.numel():
-        kv_for_q = lengths_kv
-    else:
-        raise ValueError("lengths_kv must have 1 or batch_size elements")
-    kv_total = (kv_for_q + lengths_q).to(torch.float64)
-    token_pairs = torch.sum(q * kv_total).item()
-    total_flops = 4.0 * num_heads * head_dim * token_pairs
-    return total_flops * 1e-12 / (latency_ms * 1e-3)
-
-
-def _reference_varlen_attention_with_cache(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    lengths_q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    cu_seqlens_kv: torch.Tensor,
-    scale: float,
-    is_mla: bool,
-    context_batch_size: int,
-) -> torch.Tensor:
-    bsz, n_heads, _, _ = q.shape
-    total_context_len = int(cu_seqlens_kv[-1].item())
-    out = torch.zeros_like(q)
-    for b in range(bsz):
-        lq = int(lengths_q[b].item())
-        if lq == 0:
-            continue
-        ctx_batch = 0 if context_batch_size == 1 else b
-        c_start = int(cu_seqlens_kv[ctx_batch].item())
-        c_end = int(cu_seqlens_kv[ctx_batch + 1].item())
-        for h in range(n_heads):
-            q_bh = q[b, h, :lq, :]
-            if is_mla:
-                k_main = k[b, h, :lq, :]
-                v_main = k_main
-                k_ctx = k_cache[c_start:c_end, :]
-                v_ctx = k_ctx
-            else:
-                k_main = k[b, h, :lq, :]
-                v_main = v[b, h, :lq, :]
-                row_offset = h * total_context_len
-                k_ctx = k_cache[row_offset + c_start : row_offset + c_end, :]
-                v_ctx = v_cache[row_offset + c_start : row_offset + c_end, :]
-
-            k_all = torch.cat([k_ctx, k_main], dim=0)
-            v_all = torch.cat([v_ctx, v_main], dim=0)
-            logits = torch.matmul(q_bh, k_all.transpose(0, 1)) * scale
-            probs = torch.softmax(logits.float(), dim=-1).to(q.dtype)
-            out[b, h, :lq, :] = torch.matmul(probs, v_all)
-    return out
-
-
-def _reference_dense_attention_with_cache(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    context_len: int,
-    scale: float,
-    is_mla: bool,
-    context_batch_size: int,
-) -> torch.Tensor:
-    bsz, n_heads, n_ctx, _ = q.shape
-    out = torch.zeros_like(q)
-    for b in range(bsz):
-        ctx_batch = 0 if context_batch_size == 1 else b
-        for h in range(n_heads):
-            q_bh = q[b, h, :n_ctx, :]
-            if is_mla:
-                k_main = k[b, h, :n_ctx, :]
-                v_main = k_main
-                k_ctx = k_cache[ctx_batch, 0, :context_len, :]
-                v_ctx = k_ctx
-            else:
-                k_main = k[b, h, :n_ctx, :]
-                v_main = v[b, h, :n_ctx, :]
-                k_ctx = k_cache[ctx_batch, h, :context_len, :]
-                v_ctx = v_cache[ctx_batch, h, :context_len, :]
-
-            k_all = torch.cat([k_ctx, k_main], dim=0)
-            v_all = torch.cat([v_ctx, v_main], dim=0)
-            logits = torch.matmul(q_bh, k_all.transpose(0, 1)) * scale
-            probs = torch.softmax(logits.float(), dim=-1).to(q.dtype)
-            out[b, h, :n_ctx, :] = torch.matmul(probs, v_all)
-    return out
-
-
-def _build_shared_inputs(
-    *,
-    batch_size: int,
-    num_heads: int,
-    query_seq_len_active: int,
-    query_seq_len_padded: int,
-    context_len_active: int,
-    context_subseq_len_active: int,
-    context_len_padded: int,
-    context_batch_size: int,
-    num_context_seqs_per_query: int,
-    head_dim: int,
-    has_cache: bool,
-    block_n: int,
-    q_ratio_min: float,
-    q_ratio_max: float,
-    kv_ratio_min: float,
-    kv_ratio_max: float,
-    device: torch.device,
-    dtype: torch.dtype,
-):
-    q = torch.randn(
-        (batch_size, num_heads, query_seq_len_padded, head_dim),
-        device=device,
-        dtype=dtype,
-    )
-    k = torch.randn(
-        (batch_size, num_heads, query_seq_len_padded, head_dim),
-        device=device,
-        dtype=dtype,
-    )
-    v = torch.randn(
-        (batch_size, num_heads, query_seq_len_padded, head_dim),
-        device=device,
-        dtype=dtype,
-    )
-
-    lengths_q_dense = torch.full(
-        (batch_size,), query_seq_len_active, device=device, dtype=torch.int32
-    )
-    lengths_q_varlen = _make_varlen_lengths(
-        batch_size,
-        query_seq_len_active,
-        q_ratio_min,
-        q_ratio_max,
-        device=device,
-    )
-
-    if has_cache:
-        lengths_kv_varlen = _sample_concatenated_context_lengths(
-            context_batch_size=context_batch_size,
-            context_subseq_len_active=context_subseq_len_active,
-            num_context_seqs_per_query=num_context_seqs_per_query,
-            kv_ratio_min=kv_ratio_min,
-            kv_ratio_max=kv_ratio_max,
-            device=device,
-        )
-        context_k = torch.randn(
-            (context_batch_size, num_heads, context_len_padded, head_dim),
-            device=device,
-            dtype=dtype,
-        )
-        context_v = torch.randn_like(context_k)
-    else:
-        lengths_kv_varlen = torch.zeros(
-            context_batch_size, device=device, dtype=torch.int32
-        )
-        context_k = torch.empty(
-            (context_batch_size, num_heads, 0, head_dim), device=device, dtype=dtype
-        )
-        context_v = torch.empty_like(context_k)
-
-    if has_cache:
-        if context_batch_size == 1:
-            k_cache_dense = context_k.expand(
-                batch_size, num_heads, context_len_padded, head_dim
-            ).contiguous()
-            v_cache_dense = context_v.expand(
-                batch_size, num_heads, context_len_padded, head_dim
-            ).contiguous()
-            lengths_kv_dense = torch.tensor(
-                [context_len_active], device=device, dtype=torch.int32
-            )
-        else:
-            k_cache_dense = context_k
-            v_cache_dense = context_v
-            lengths_kv_dense = torch.full(
-                (batch_size,), context_len_active, device=device, dtype=torch.int32
-            )
-    else:
-        k_cache_dense = torch.empty(
-            (batch_size, num_heads, 0, head_dim), device=device, dtype=dtype
-        )
-        v_cache_dense = torch.empty_like(k_cache_dense)
-        lengths_kv_dense = torch.zeros(
-            1 if context_batch_size == 1 else batch_size,
-            device=device,
-            dtype=torch.int32,
-        )
-
-    cu_seqlens_kv = _build_cu_seqlens(lengths_kv_varlen)
-    total_context_len = int(cu_seqlens_kv[-1].item())
-
-    if total_context_len > 0:
-        mla_k_chunks = []
-        mla_v_chunks = []
-        for c in range(context_batch_size):
-            lc = int(lengths_kv_varlen[c].item())
-            if lc > 0:
-                mla_k_chunks.append(context_k[c, 0, :lc, :])
-                mla_v_chunks.append(context_v[c, 0, :lc, :])
-        k_cache_compact_mla = torch.cat(mla_k_chunks, dim=0)
-        v_cache_compact_mla = torch.cat(mla_v_chunks, dim=0)
-
-        non_mla_k_chunks = []
-        non_mla_v_chunks = []
-        for h in range(num_heads):
-            for c in range(context_batch_size):
-                lc = int(lengths_kv_varlen[c].item())
-                if lc > 0:
-                    non_mla_k_chunks.append(context_k[c, h, :lc, :])
-                    non_mla_v_chunks.append(context_v[c, h, :lc, :])
-        k_cache_compact = torch.cat(non_mla_k_chunks, dim=0)
-        v_cache_compact = torch.cat(non_mla_v_chunks, dim=0)
-    else:
-        k_cache_compact_mla = torch.empty((0, head_dim), device=device, dtype=dtype)
-        v_cache_compact_mla = torch.empty_like(k_cache_compact_mla)
-        k_cache_compact = torch.empty((0, head_dim), device=device, dtype=dtype)
-        v_cache_compact = torch.empty_like(k_cache_compact)
-
-    q_meta = build_pack_metadata(
-        lengths_q_varlen, query_seq_len_padded, block_n=block_n
-    )
-
-    return {
-        "q": q,
-        "k": k,
-        "v": v,
-        "scale": 1.0 / math.sqrt(head_dim),
-        "lengths_q_dense": lengths_q_dense,
-        "lengths_q_varlen": lengths_q_varlen,
-        "lengths_kv_dense": lengths_kv_dense,
-        "lengths_kv_varlen": lengths_kv_varlen,
-        "k_cache_dense": k_cache_dense,
-        "v_cache_dense": v_cache_dense,
-        "k_cache_compact": k_cache_compact,
-        "v_cache_compact": v_cache_compact,
-        "k_cache_compact_mla": k_cache_compact_mla,
-        "v_cache_compact_mla": v_cache_compact_mla,
-        "cu_seqlens_kv": cu_seqlens_kv,
-        "total_context_len": total_context_len,
-        "q_meta": q_meta,
-    }
 
 
 def _bench_noncompressed(
@@ -487,7 +173,6 @@ def _bench_scenarios_for_context(
     query_seq_len_active: int,
     query_seq_len_padded: int,
     context_subseq_len_padded: int,
-    context_batch_size: int,
     head_dim: int,
     latent_head_dim: int,
     num_context_seqs_per_query: int,
@@ -502,16 +187,17 @@ def _bench_scenarios_for_context(
     device: torch.device,
 ) -> list[dict]:
     context_len = context_subseq_len * num_context_seqs_per_query
-    context_len_padded = context_subseq_len_padded * num_context_seqs_per_query
     rows = []
     sections = [
-        ("Non-MLA + Non-Cache", False, False),
-        ("Non-MLA + Cache", False, True),
-        ("MLA + Non-Cache", True, False),
-        ("MLA + Cache", True, True),
+        ("Non-MLA + Non-Cache", False, False, 1),
+        ("Non-MLA + Cache (Single)", False, True, 1),
+        ("Non-MLA + Cache (Full)", False, True, batch_size),
+        ("MLA + Non-Cache", True, False, 1),
+        ("MLA + Cache (Single)", True, True, 1),
+        ("MLA + Cache (Full)", True, True, batch_size),
     ]
 
-    for section, is_mla, has_cache in sections:
+    for section, is_mla, has_cache, section_context_batch_size in sections:
         section_head_dim = latent_head_dim if is_mla else head_dim
         section_context_len = context_len if has_cache else 0
         payload = _build_shared_inputs(
@@ -521,8 +207,8 @@ def _bench_scenarios_for_context(
             query_seq_len_padded=query_seq_len_padded,
             context_len_active=context_len,
             context_subseq_len_active=context_subseq_len,
-            context_len_padded=context_len_padded,
-            context_batch_size=context_batch_size,
+            context_subseq_len_padded=context_subseq_len_padded,
+            context_batch_size=section_context_batch_size,
             num_context_seqs_per_query=num_context_seqs_per_query,
             head_dim=section_head_dim,
             has_cache=has_cache,
@@ -540,7 +226,7 @@ def _bench_scenarios_for_context(
             is_mla=is_mla,
             num_heads=num_heads,
             context_len_active=section_context_len,
-            context_batch_size=context_batch_size,
+            context_batch_size=section_context_batch_size,
             head_dim=section_head_dim,
             block_m=block_m,
             block_n=block_n,
@@ -553,7 +239,7 @@ def _bench_scenarios_for_context(
                 is_mla=is_mla,
                 num_heads=num_heads,
                 head_dim=section_head_dim,
-                context_batch_size=context_batch_size,
+                context_batch_size=section_context_batch_size,
                 block_m=block_m,
                 block_n=block_n,
                 auto_tune_tiles=auto_tune_tiles,
@@ -561,9 +247,19 @@ def _bench_scenarios_for_context(
             )
         )
 
+        mean_context_subseq_len = (
+            float(payload["lengths_kv_varlen"].to(torch.float32).mean().item())
+            / float(num_context_seqs_per_query)
+            if num_context_seqs_per_query > 0
+            else 0.0
+        )
+
         rows.append(
             {
                 "context_len": context_len,
+                "mean_context_subseq_len": mean_context_subseq_len,
+                "query_batch_size": batch_size,
+                "has_cache": has_cache,
                 "section": section,
                 "standard_ms": standard_ms,
                 "noncompressed_ms": noncompressed_ms,
@@ -607,7 +303,8 @@ def _print_results(rows: list[dict], *, context_len: int):
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark four sections (non-MLA/MLA x non-cache/cache) and report "
+            "Benchmark six sections (non-MLA/MLA x non-cache/single-cache/full-cache) "
+            "and report "
             "three bars per section: standard attention, non-compressed kernel, "
             "compressed kernel."
         )
@@ -628,12 +325,6 @@ def main():
             "Active (true) max context length per context subsequence before "
             "optional --max-len padding."
         ),
-    )
-    parser.add_argument(
-        "--context-batch-size",
-        type=int,
-        default=1,
-        help="Number of context sequences: 1 (shared) or batch-size (per sample).",
     )
     parser.add_argument(
         "--num-context-seqs-per-query",
@@ -692,8 +383,6 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark")
 
-    if args.context_batch_size not in (1, args.batch_size):
-        raise ValueError("context-batch-size must be 1 or equal to batch-size")
     if args.num_context_seqs_per_query < 1:
         raise ValueError("num-context-seqs-per-query must be >= 1")
     if args.context_len < 0:
@@ -719,7 +408,6 @@ def main():
         query_seq_len_active=args.query_len,
         query_seq_len_padded=query_seq_len_padded,
         context_subseq_len_padded=context_len_padded,
-        context_batch_size=args.context_batch_size,
         head_dim=args.head_dim,
         latent_head_dim=args.latent_head_dim,
         num_context_seqs_per_query=args.num_context_seqs_per_query,
@@ -733,8 +421,19 @@ def main():
         check_correctness=args.check_correctness,
         device=device,
     )
+    cache_rows = [row for row in rows if row["has_cache"]]
+    plot_mean_context_subseq_len = (
+        sum(row["mean_context_subseq_len"] for row in cache_rows) / len(cache_rows)
+        if cache_rows
+        else 0.0
+    )
     _print_results(rows, context_len=args.context_len)
-    write_benchmark_bar_plots(rows, context_len=args.context_len, plots_dir=plots_dir)
+    write_benchmark_bar_plots(
+        rows,
+        mean_context_subseq_len=plot_mean_context_subseq_len,
+        query_batch_size=args.batch_size,
+        plots_dir=plots_dir,
+    )
 
     print(f"\nSaved plots to: {plots_dir.resolve()}")
 

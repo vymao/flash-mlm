@@ -1,13 +1,30 @@
 import torch
 
 import triton
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 from flash_mlm.host_utils import (
     PackMetadata,
     pack_for_kernel,
     pad_packed_main_tensors_for_mlm_compressed,
 )
-from flash_mlm.mlm_kernel import _mlm_compressed_kernel, _mlm_main_kernel
+from flash_mlm.kernel_utils import supports_host_descriptor
+from flash_mlm.mlm_kernel import (
+    _MLM_BLOCK_M_OPTIONS,
+    _mlm_compressed_kernel,
+    _mlm_compressed_kernel_auto_block_m,
+    _mlm_main_kernel,
+    _mlm_main_kernel_auto_tile,
+)
+
+
+def _make_host_desc(x: torch.Tensor, rows: int, head_dim: int) -> TensorDescriptor:
+    return TensorDescriptor(
+        x,
+        shape=[rows, head_dim],
+        strides=[head_dim, 1],
+        block_shape=[1, 1],
+    )
 
 
 def flash_attn_mlm(
@@ -23,7 +40,8 @@ def flash_attn_mlm(
     cu_seqlens_q: torch.Tensor | None = None,
     cu_seqlens_kv: torch.Tensor | None = None,
     block_m: int = 64,
-    block_n: int = 64,
+    block_n: int = 32,
+    auto_tune_tiles: bool = False,
 ) -> torch.Tensor:
     """Basic host launcher for _mlm_main_kernel.
 
@@ -61,6 +79,9 @@ def flash_attn_mlm(
     if context_batch_size < 1:
         raise ValueError("context_batch_size must be >= 1")
 
+    # Kept for API compatibility with compressed path / future varlen main path.
+    _ = (cu_seqlens_q, cu_seqlens_kv)
+
     if d not in (16, 32, 64, 128, 256):
         raise ValueError("HEAD_DIM must be one of {16, 32, 64, 128, 256}")
 
@@ -72,34 +93,66 @@ def flash_attn_mlm(
 
     out = torch.empty_like(q)
 
-    # Current kernel signature includes these args; they are not yet consumed in-kernel.
-    if cu_seqlens_q is None:
-        cu_seqlens_q = torch.zeros(1, device=q.device, dtype=torch.int32)
-    if cu_seqlens_kv is None:
-        cu_seqlens_kv = torch.zeros(1, device=q.device, dtype=torch.int32)
+    if supports_host_descriptor():
+        y_dim = b * h * n
+        y_dim_context = (
+            context_batch_size * context_len
+            if is_mla
+            else context_batch_size * h * context_len
+        )
+        desc_q = _make_host_desc(q, y_dim, d)
+        desc_k = _make_host_desc(k, y_dim, d)
+        desc_v = _make_host_desc(v, y_dim, d)
+        desc_o = _make_host_desc(out, y_dim, d)
+        desc_k_cache = _make_host_desc(k_cache, y_dim_context, d)
+        desc_v_cache = _make_host_desc(v_cache, y_dim_context, d)
+    else:
+        desc_q = q
+        desc_k = k
+        desc_v = v
+        desc_o = out
+        desc_k_cache = k_cache
+        desc_v_cache = v_cache
 
     grid = (triton.cdiv(n, block_n), b * h, 1)
 
-    _mlm_main_kernel[grid](
-        q,
-        k,
-        v,
-        out,
-        k_cache,
-        v_cache,
-        b,
-        context_batch_size,
-        h,
-        context_len,
-        scale,
-        n,
-        cu_seqlens_q,
-        cu_seqlens_kv,
-        is_mla=is_mla,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        HEAD_DIM=d,
-    )
+    if auto_tune_tiles:
+        _mlm_main_kernel_auto_tile[grid](
+            desc_q,
+            desc_k,
+            desc_v,
+            desc_o,
+            desc_k_cache,
+            desc_v_cache,
+            b,
+            context_batch_size,
+            h,
+            context_len,
+            scale,
+            n,
+            is_mla=is_mla,
+            BLOCK_N=block_n,
+            HEAD_DIM=d,
+        )
+    else:
+        _mlm_main_kernel[grid](
+            desc_q,
+            desc_k,
+            desc_v,
+            desc_o,
+            desc_k_cache,
+            desc_v_cache,
+            b,
+            context_batch_size,
+            h,
+            context_len,
+            scale,
+            n,
+            is_mla=is_mla,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            HEAD_DIM=d,
+        )
 
     return out
 
@@ -118,7 +171,8 @@ def flash_attn_mlm_compressed(
     is_mla: bool = False,
     context_batch_size: int | None = None,
     block_m: int = 64,
-    block_n: int = 64,
+    block_n: int = 32,
+    auto_tune_tiles: bool = False,
 ) -> torch.Tensor:
     """Host launcher for packed-sequence `_mlm_compressed_kernel`.
 
@@ -187,6 +241,8 @@ def flash_attn_mlm_compressed(
         raise ValueError("q_meta was built with different block_n")
     cu_seqlens_q = q_meta.cu_seqlens
 
+    pad_block_m = max(_MLM_BLOCK_M_OPTIONS) if auto_tune_tiles else block_m
+
     q, k, v, total_q_len = pad_packed_main_tensors_for_mlm_compressed(
         q,
         k,
@@ -195,7 +251,7 @@ def flash_attn_mlm_compressed(
         is_mla=is_mla,
         total_q_len_unpadded=total_q_len_unpadded,
         cu_seqlens_q=cu_seqlens_q,
-        block_m=block_m,
+        block_m=pad_block_m,
         block_n=block_n,
     )
 
@@ -274,27 +330,67 @@ def flash_attn_mlm_compressed(
     out = torch.empty_like(q)
     grid = (num_q_tiles, num_heads, 1)
 
-    _mlm_compressed_kernel[grid](
-        q,
-        k,
-        v,
-        out,
-        k_cache,
-        v_cache,
-        context_batch_size,
-        num_heads,
-        total_context_len,
-        scale,
-        total_q_len,
-        batch_ids_q,
-        q_tile_starts_q,
-        cu_seqlens_q,
-        cu_seqlens_kv,
-        is_mla=is_mla,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        HEAD_DIM=d,
-    )
+    if supports_host_descriptor():
+        y_dim_q = num_heads * total_q_len
+        y_dim_kv_main = total_q_len if is_mla else num_heads * total_q_len
+        y_dim_context = total_context_len if is_mla else num_heads * total_context_len
+        desc_q = _make_host_desc(q, y_dim_q, d)
+        desc_k = _make_host_desc(k, y_dim_kv_main, d)
+        desc_v = _make_host_desc(v, y_dim_kv_main, d)
+        desc_o = _make_host_desc(out, y_dim_q, d)
+        desc_k_cache = _make_host_desc(k_cache, y_dim_context, d)
+        desc_v_cache = _make_host_desc(v_cache, y_dim_context, d)
+    else:
+        desc_q = q
+        desc_k = k
+        desc_v = v
+        desc_o = out
+        desc_k_cache = k_cache
+        desc_v_cache = v_cache
+
+    if auto_tune_tiles:
+        _mlm_compressed_kernel_auto_block_m[grid](
+            desc_q,
+            desc_k,
+            desc_v,
+            desc_o,
+            desc_k_cache,
+            desc_v_cache,
+            context_batch_size,
+            num_heads,
+            total_context_len,
+            scale,
+            total_q_len,
+            batch_ids_q,
+            q_tile_starts_q,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            is_mla=is_mla,
+            BLOCK_N=block_n,
+            HEAD_DIM=d,
+        )
+    else:
+        _mlm_compressed_kernel[grid](
+            desc_q,
+            desc_k,
+            desc_v,
+            desc_o,
+            desc_k_cache,
+            desc_v_cache,
+            context_batch_size,
+            num_heads,
+            total_context_len,
+            scale,
+            total_q_len,
+            batch_ids_q,
+            q_tile_starts_q,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            is_mla=is_mla,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            HEAD_DIM=d,
+        )
 
     if total_q_len != total_q_len_unpadded:
         out = (

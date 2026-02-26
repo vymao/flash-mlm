@@ -1,12 +1,12 @@
 # flash-mlm
 
-Triton-based Flash MLM attention kernels for PyTorch.
+Triton-based attention kernels optimized for MLM-based models, in PyTorch.
 
 ## Highlights
 
 - ✅ Packed variable-length query/key/value path
 - ✅ Optional packed KV cache path
-- ✅ MLA + non-MLA support
+- ✅ MLA + non-MLA support (no RoPE)
 - ✅ Benchmarks for context scaling and batch scaling
 
 ```text
@@ -16,6 +16,15 @@ Triton-based Flash MLM attention kernels for PyTorch.
    -> packed output
    -> unpack to [B,H,N,D]
 ```
+
+## On the Roadmap
+- **Backpropagation support**: Generally this is not as critical because one can always just use `flash_attn_varlen_func` in the usual Flash-Attention implementation, though that requires more kernels.
+- **Faster and more efficient tile scheduling**: Right now, we don't explicitly include a tile scheduler because we pack the sequences to omit non-attended tokens (ex. padding). This costs overhead in the host function.
+- **Variable context batch sizes**: Currently, only a single context or a full batch (equal to the query batch size) is supported. Variable context batch sizes with index mapping would be a useful extension.
+- **Compatibility with RoPE**: Currently, we don't support RoPE with MLA.
+- **Paged Attention for KV cache**
+
+Contributions are most welcome!
 
 ## Requirements
 

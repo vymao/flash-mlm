@@ -8,7 +8,7 @@ from flash_mlm.host_utils import build_pack_metadata
 from flash_mlm.kernel_utils import is_hip
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
-N_HEADS_DEFAULT = 32
+N_HEADS_DEFAULT = 20
 QUERY_SEQ_LEN = 600
 FIXED_CONTEXT_LEN = 500 if is_hip() else 1000
 

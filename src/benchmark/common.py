@@ -4,6 +4,7 @@ import torch
 import triton
 
 from flash_mlm.host import flash_attn_mlm_compressed
+from flash_mlm.cache import InferenceCache
 from flash_mlm.host_utils import build_pack_metadata
 from flash_mlm.kernel_utils import is_hip
 
@@ -113,19 +114,30 @@ def run_mlm_compressed_case(
         )
         v_cache = torch.randn_like(k_cache)
 
+    inference_cache = InferenceCache()
+    inference_cache.prefill_kv_cache(
+        layer_id=0,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        total_context_len=total_context_len,
+        cu_seqlens_kv=cu_seqlens_kv,
+        context_batch_size=context_batch_size,
+        is_mla=is_mla,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
+
     sm_scale = 1.0 / math.sqrt(head_dim)
 
     fn = lambda: flash_attn_mlm_compressed(
         q,
         k,
         v,
-        k_cache,
-        v_cache,
         num_heads=num_heads,
         q_meta=q_meta,
-        total_context_len=total_context_len,
-        cu_seqlens_kv=cu_seqlens_kv,
         scale=sm_scale,
+        inference_cache=inference_cache,
+        layer_id=0,
         is_mla=is_mla,
         context_batch_size=context_batch_size,
         block_m=block_m,

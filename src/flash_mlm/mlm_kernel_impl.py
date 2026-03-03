@@ -18,7 +18,8 @@ def _mlm_inner_attention(
     m_i,
     o_i,
     scale,
-    N,
+    q_valid_start,
+    q_valid_end,
     K_START,
     K_END,
     BLOCK_M: tl.constexpr,
@@ -38,7 +39,8 @@ def _mlm_inner_attention(
         attn = tl.dot(Q_block, tl.trans(K_block)) * scale_log2
 
         kv_valid = kv_start_offsets < K_END
-        attn_mask = (q_start_offsets[:, None] < N) & kv_valid[None, :]
+        q_valid = (q_start_offsets >= q_valid_start) & (q_start_offsets < q_valid_end)
+        attn_mask = q_valid[:, None] & kv_valid[None, :]
         attn = tl.where(attn_mask, attn, float("-inf"))
 
         max_val_block = tl.max(attn, axis=1)
@@ -159,6 +161,7 @@ def _mlm_main_kernel_impl(
         m_i,
         o_i,
         scale,
+        0,
         seq_len,
         0,
         context_len,
@@ -177,6 +180,7 @@ def _mlm_main_kernel_impl(
         m_i,
         o_i,
         scale,
+        0,
         seq_len,
         0,
         seq_len,
@@ -214,6 +218,7 @@ def _mlm_compressed_kernel_impl(
     cu_seqlens_q,
     cu_seqlens_kv,
     is_mla: tl.constexpr,
+    causal_query_seq_attn: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -272,7 +277,15 @@ def _mlm_compressed_kernel_impl(
     q_start = tl.load(cu_seqlens_q + batch_idx)
     q_end = tl.load(cu_seqlens_q + batch_idx + 1)
     q_len = q_end - q_start
-    q_start_offsets = (start_block_q - q_start) + tl.arange(0, BLOCK_N)
+    q_start_offsets = start_block_q + tl.arange(0, BLOCK_N)
+    q_valid_start = q_start
+    q_valid_end = q_end
+    if causal_query_seq_attn:
+        kv_main_k_start = 0
+        kv_main_k_end = q_end
+    else:
+        kv_main_k_start = q_start
+        kv_main_k_end = q_end
 
     Q_block = desc_q.load([q_tile_block_offset, 0])
 
@@ -288,11 +301,11 @@ def _mlm_compressed_kernel_impl(
     kv_context_end = tl.load(cu_seqlens_kv + context_batch_offset + 1)
     kv_context_len = kv_context_end - kv_context_start
 
-    kv_context_start_offset = kv_context_start + context_head_offset
+    kv_context_start_offset = context_head_offset
     if is_mla:
-        kv_main_start_offset = q_start
+        kv_main_start_offset = 0
     else:
-        kv_main_start_offset = q_start + q_head_offset
+        kv_main_start_offset = q_head_offset
 
     m_i = tl.full([BLOCK_N], -float("inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_N], dtype=tl.float32)
@@ -308,9 +321,10 @@ def _mlm_compressed_kernel_impl(
         m_i,
         o_i,
         scale,
-        q_len,
-        0,
-        kv_context_len,
+        q_valid_start,
+        q_valid_end,
+        kv_context_start,
+        kv_context_end,
         BLOCK_M,
         HEAD_DIM,
         is_mla,
@@ -326,9 +340,10 @@ def _mlm_compressed_kernel_impl(
         m_i,
         o_i,
         scale,
-        q_len,
-        0,
-        q_len,
+        q_valid_start,
+        q_valid_end,
+        kv_main_k_start,
+        kv_main_k_end,
         BLOCK_M,
         HEAD_DIM,
         is_mla,
@@ -336,7 +351,7 @@ def _mlm_compressed_kernel_impl(
 
     l_safe = tl.where(l_i > 0, l_i, 1.0)
     o_i = o_i / l_safe[:, None]
-    q_valid = (q_start_offsets >= 0) & (q_start_offsets < q_len)
+    q_valid = (q_start_offsets >= q_start) & (q_start_offsets < q_end)
     _maybe_write_tensor_descriptor(
         out_ptr,
         q_tile_block_offset,

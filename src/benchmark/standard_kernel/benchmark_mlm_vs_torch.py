@@ -11,15 +11,18 @@ if str(_PARENT) not in sys.path:
     sys.path.insert(0, str(_PARENT))
 
 from flash_mlm.host import flash_attn_mlm, flash_attn_mlm_compressed  # noqa: E402
+from flash_mlm.cache import InferenceCache  # noqa: E402
 from flash_mlm.host_utils import unpack_from_kernel  # noqa: E402
-from benchmark_utils import (  # noqa: E402
+from benchmark.standard_kernel.utils import (  # noqa: E402
     _build_shared_inputs,
     _estimate_tflops,
     _reference_dense_attention_with_cache,
     _reference_varlen_attention_with_cache,
     _resolve_padded_len,
 )
-from utils.plot_utils import write_benchmark_bar_plots  # noqa: E402
+from benchmark.standard_kernel.plot_utils import (
+    write_benchmark_bar_plots,
+)  # noqa: E402
 
 
 def _bench_noncompressed(
@@ -107,18 +110,29 @@ def _bench_compressed(
         k_cache = payload["k_cache_compact"]
         v_cache = payload["v_cache_compact"]
 
+    inference_cache = InferenceCache()
+    inference_cache.prefill_kv_cache(
+        layer_id=0,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        total_context_len=payload["total_context_len"],
+        cu_seqlens_kv=payload["cu_seqlens_kv"],
+        context_batch_size=context_batch_size,
+        is_mla=is_mla,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
+
     def _flash_fn():
         return flash_attn_mlm_compressed(
             payload["q"],
             payload["k"],
             payload["v"],
-            k_cache,
-            v_cache,
             num_heads=num_heads,
             q_meta=payload["q_meta"],
-            total_context_len=payload["total_context_len"],
-            cu_seqlens_kv=payload["cu_seqlens_kv"],
             scale=payload["scale"],
+            inference_cache=inference_cache,
+            layer_id=0,
             is_mla=is_mla,
             context_batch_size=context_batch_size,
             block_m=block_m,

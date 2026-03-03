@@ -243,6 +243,7 @@ def _mlm_compressed_kernel(
     cu_seqlens_q,  # cumulative packed query lengths [B+1]
     cu_seqlens_kv,  # cumulative packed context lengths [context_batch_size+1]
     is_mla: tl.constexpr,
+    causal_query_seq_attn: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -264,6 +265,7 @@ def _mlm_compressed_kernel(
         cu_seqlens_q,
         cu_seqlens_kv,
         is_mla,
+        causal_query_seq_attn,
         BLOCK_M,
         BLOCK_N,
         HEAD_DIM,
@@ -299,6 +301,7 @@ def _mlm_compressed_kernel_auto_block_m(
     cu_seqlens_q,  # cumulative packed query lengths [B+1]
     cu_seqlens_kv,  # cumulative packed context lengths [context_batch_size+1]
     is_mla: tl.constexpr,
+    causal_query_seq_attn: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -320,6 +323,7 @@ def _mlm_compressed_kernel_auto_block_m(
         cu_seqlens_q,
         cu_seqlens_kv,
         is_mla,
+        causal_query_seq_attn,
         BLOCK_M,
         BLOCK_N,
         HEAD_DIM,

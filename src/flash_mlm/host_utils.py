@@ -1,6 +1,10 @@
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from flash_mlm.cache import PackingCache
 
 
 @dataclass
@@ -150,25 +154,12 @@ def pack_for_kernel(
     return packed
 
 
-def pad_packed_main_tensors_for_mlm_compressed(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    num_heads: int,
-    is_mla: bool,
+def _compute_total_q_len_padded(
     total_q_len_unpadded: int,
     cu_seqlens_q: torch.Tensor,
     block_m: int,
     block_n: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Pad flattened packed main q/k/v rows for descriptor-safe tile loads.
-
-    This helper is specific to the compressed kernel launch contract where
-    q/k/v are flattened as [heads * packed_len, D] for q and either
-    [heads * packed_len, D] (non-MLA) or [packed_len, D] (MLA) for k/v.
-    """
-
+) -> int:
     tile_align = max(block_m, block_n)
     seq_lengths_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
     seq_tile_ends_q = (
@@ -183,7 +174,196 @@ def pad_packed_main_tensors_for_mlm_compressed(
     max_required_q_len = (
         int(torch.max(seq_tile_ends_q).item()) if seq_tile_ends_q.numel() > 0 else 0
     )
-    total_q_len_padded = max(total_q_len_unpadded, max_required_q_len)
+    return max(total_q_len_unpadded, max_required_q_len)
+
+
+def require_cuda_tensors(
+    *tensors: torch.Tensor, message: str = "All tensors must be CUDA tensors"
+):
+    if not all(t.is_cuda for t in tensors):
+        raise ValueError(message)
+
+
+def validate_qkv_same_shape_rank4(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    error_prefix: str,
+) -> tuple[int, int, int, int]:
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError(f"{error_prefix} must be rank-4 tensors [B, H, N, D]")
+    if q.shape != k.shape or q.shape != v.shape:
+        raise ValueError("q, k, v must have the same shape")
+    b, h, n, d = q.shape
+    return int(b), int(h), int(n), int(d)
+
+
+def validate_head_dim_supported(head_dim: int):
+    if head_dim not in (16, 32, 64, 128, 256):
+        raise ValueError("HEAD_DIM must be one of {16, 32, 64, 128, 256}")
+
+
+def validate_cu_seqlens_rank1_min2(*cu_seqlens: torch.Tensor):
+    for x in cu_seqlens:
+        if x.ndim != 1:
+            raise ValueError("cu_seqlens tensors must be rank-1")
+        if x.numel() < 2:
+            raise ValueError("cu_seqlens tensors must have at least 2 elements")
+
+
+def validate_packed_cache_shapes(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    *,
+    num_heads: int,
+    total_context_len: int,
+    head_dim: int,
+    is_mla: bool,
+):
+    if k_cache.ndim != 2 or v_cache.ndim != 2:
+        raise ValueError("k_cache/v_cache must be rank-2 packed tensors")
+    if v_cache.shape != k_cache.shape:
+        raise ValueError("v_cache shape must match k_cache shape")
+    if k_cache.shape[1] != head_dim:
+        raise ValueError("k_cache/v_cache second dim must match q/k/v head_dim")
+    expected_context_rows = (
+        total_context_len if is_mla else num_heads * total_context_len
+    )
+    if k_cache.shape[0] != expected_context_rows:
+        raise ValueError(
+            "k_cache/v_cache first dim mismatch: expected "
+            f"{expected_context_rows} rows for is_mla={is_mla}"
+        )
+
+
+def make_contiguous(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    return tuple(t.contiguous() for t in tensors)
+
+
+def _pack_flatten_for_kernel_into(
+    x: torch.Tensor,
+    meta: PackMetadata,
+    expected_heads: int,
+    total_q_len_padded: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    if x.ndim != 4:
+        raise ValueError("x must be rank-4 [B, H, N, D]")
+    b, h, n, d = x.shape
+    if b != meta.B or n != meta.N:
+        raise ValueError("x shape mismatch with PackMetadata")
+    if h != expected_heads:
+        raise ValueError("x head dimension mismatch for requested packed output")
+    if out.shape != (expected_heads * total_q_len_padded, d):
+        raise ValueError("out has unexpected shape for packed output")
+
+    x_hbnd = x.permute(1, 0, 2, 3).contiguous().view(expected_heads, b * n, d)
+    out_h = out.view(expected_heads, total_q_len_padded, d)
+    packed_main = out_h[:, : meta.total_tokens, :]
+    torch.index_select(x_hbnd, dim=1, index=meta.token_indices, out=packed_main)
+    if total_q_len_padded > meta.total_tokens:
+        out_h[:, meta.total_tokens :, :].zero_()
+    return out
+
+
+def pack_and_pad_main_tensors_for_mlm_compressed(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    q_meta: PackMetadata,
+    num_heads: int,
+    is_mla: bool,
+    block_m: int,
+    block_n: int,
+    packing_cache: "PackingCache | None" = None,
+    q_buffer_name: str = "q",
+    k_buffer_name: str = "k",
+    v_buffer_name: str = "v",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Fused pack + pad into final flattened q/k/v buffers for compressed kernel."""
+
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("q/k/v must be rank-4 padded tensors [B, H, N, D]")
+    b, h, n, d = q.shape
+    if q_meta.B != b or q_meta.N != n:
+        raise ValueError("q_meta shape metadata does not match q/k/v padded shape")
+    if h != num_heads:
+        raise ValueError("q/k/v head dimension must match num_heads")
+
+    total_q_len_unpadded = q_meta.total_tokens
+    total_q_len_padded = _compute_total_q_len_padded(
+        total_q_len_unpadded,
+        q_meta.cu_seqlens,
+        block_m,
+        block_n,
+    )
+
+    def _alloc(name: str, rows: int, cols: int, template: torch.Tensor) -> torch.Tensor:
+        if packing_cache is None:
+            return torch.empty(
+                (rows, cols), dtype=template.dtype, device=template.device
+            )
+        return packing_cache.get_2d(
+            name,
+            rows,
+            cols,
+            dtype=template.dtype,
+            device=template.device,
+        )
+
+    q_out = _alloc(q_buffer_name, num_heads * total_q_len_padded, d, q)
+    q_out = _pack_flatten_for_kernel_into(
+        q, q_meta, num_heads, total_q_len_padded, q_out
+    )
+
+    if is_mla:
+        k_src = k[:, :1, :, :]
+        k_out = _alloc(k_buffer_name, total_q_len_padded, d, k_src)
+        k_out = _pack_flatten_for_kernel_into(
+            k_src, q_meta, 1, total_q_len_padded, k_out
+        )
+        v_out = k_out
+    else:
+        k_out = _alloc(k_buffer_name, num_heads * total_q_len_padded, d, k)
+        v_out = _alloc(v_buffer_name, num_heads * total_q_len_padded, d, v)
+        k_out = _pack_flatten_for_kernel_into(
+            k, q_meta, num_heads, total_q_len_padded, k_out
+        )
+        v_out = _pack_flatten_for_kernel_into(
+            v, q_meta, num_heads, total_q_len_padded, v_out
+        )
+
+    return q_out, k_out, v_out, total_q_len_padded
+
+
+def pad_packed_main_tensors_for_mlm_compressed(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    num_heads: int,
+    is_mla: bool,
+    total_q_len_unpadded: int,
+    cu_seqlens_q: torch.Tensor,
+    block_m: int,
+    block_n: int,
+    packing_cache: "PackingCache | None" = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Pad flattened packed main q/k/v rows for descriptor-safe tile loads.
+
+    This helper is specific to the compressed kernel launch contract where
+    q/k/v are flattened as [heads * packed_len, D] for q and either
+    [heads * packed_len, D] (non-MLA) or [packed_len, D] (MLA) for k/v.
+    """
+
+    total_q_len_padded = _compute_total_q_len_padded(
+        total_q_len_unpadded,
+        cu_seqlens_q,
+        block_m,
+        block_n,
+    )
 
     if total_q_len_padded == total_q_len_unpadded:
         return q, k, v, total_q_len_unpadded
@@ -200,10 +380,54 @@ def pad_packed_main_tensors_for_mlm_compressed(
         pad = x.new_zeros((h, pad_rows, d_local))
         return torch.cat([x_h, pad], dim=1).reshape(h * new_len, d_local).contiguous()
 
+    def _pad_packed_per_head_with_workspace(
+        x: torch.Tensor,
+        h: int,
+        old_len: int,
+        new_len: int,
+        name: str,
+    ):
+        d_local = x.shape[1]
+        out = packing_cache.get_2d(
+            name,
+            h * new_len,
+            d_local,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        x_h = x.reshape(h, old_len, d_local)
+        out_h = out.reshape(h, new_len, d_local)
+        out_h[:, :old_len, :].copy_(x_h)
+        out_h[:, old_len:, :].zero_()
+        return out
+
     kv_heads = 1 if is_mla else num_heads
-    q = _pad_packed_per_head(q, num_heads, total_q_len_unpadded, total_q_len_padded)
-    k = _pad_packed_per_head(k, kv_heads, total_q_len_unpadded, total_q_len_padded)
-    v = _pad_packed_per_head(v, kv_heads, total_q_len_unpadded, total_q_len_padded)
+    if packing_cache is None:
+        q = _pad_packed_per_head(q, num_heads, total_q_len_unpadded, total_q_len_padded)
+        k = _pad_packed_per_head(k, kv_heads, total_q_len_unpadded, total_q_len_padded)
+        v = _pad_packed_per_head(v, kv_heads, total_q_len_unpadded, total_q_len_padded)
+    else:
+        q = _pad_packed_per_head_with_workspace(
+            q,
+            num_heads,
+            total_q_len_unpadded,
+            total_q_len_padded,
+            "q",
+        )
+        k = _pad_packed_per_head_with_workspace(
+            k,
+            kv_heads,
+            total_q_len_unpadded,
+            total_q_len_padded,
+            "k",
+        )
+        v = _pad_packed_per_head_with_workspace(
+            v,
+            kv_heads,
+            total_q_len_unpadded,
+            total_q_len_padded,
+            "v",
+        )
     return q, k, v, total_q_len_padded
 
 

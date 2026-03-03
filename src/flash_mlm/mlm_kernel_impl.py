@@ -311,6 +311,7 @@ def _mlm_compressed_kernel_impl(
     l_i = tl.zeros([BLOCK_N], dtype=tl.float32)
     o_i = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
 
+    # Context
     o_i, l_i, m_i = _mlm_inner_attention(
         Q_block,
         q_start_offsets,
@@ -330,6 +331,7 @@ def _mlm_compressed_kernel_impl(
         is_mla,
     )
 
+    # Main
     o_i, l_i, m_i = _mlm_inner_attention(
         Q_block,
         q_start_offsets,

@@ -40,15 +40,47 @@ def _bench_noncompressed(
 ):
     v_tensor = payload["k"] if is_mla else payload["v"]
 
+    inference_cache = InferenceCache()
+    if context_len_active > 0:
+        if is_mla:
+            k_cache_flat = payload["k_cache_dense"][:, 0, :context_len_active, :]
+            k_cache_flat = k_cache_flat.reshape(
+                context_batch_size * context_len_active, head_dim
+            )
+            v_cache_flat = k_cache_flat
+        else:
+            k_cache_flat = payload["k_cache_dense"][:, :, :context_len_active, :]
+            v_cache_flat = payload["v_cache_dense"][:, :, :context_len_active, :]
+            k_cache_flat = k_cache_flat.reshape(
+                context_batch_size * num_heads * context_len_active, head_dim
+            )
+            v_cache_flat = v_cache_flat.reshape(
+                context_batch_size * num_heads * context_len_active, head_dim
+            )
+
+        cu_seqlens_kv = torch.arange(
+            context_batch_size + 1, device=payload["q"].device, dtype=torch.int32
+        ) * int(context_len_active)
+        inference_cache.prefill_kv_cache(
+            layer_id=0,
+            k_cache=k_cache_flat,
+            v_cache=v_cache_flat,
+            total_context_len=int(context_batch_size * context_len_active),
+            cu_seqlens_kv=cu_seqlens_kv,
+            context_batch_size=context_batch_size,
+            is_mla=is_mla,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+
     def _flash_fn():
         return flash_attn_mlm(
             payload["q"],
             payload["k"],
             v_tensor,
-            payload["k_cache_dense"],
-            payload["v_cache_dense"],
-            context_len=context_len_active,
             scale=payload["scale"],
+            inference_cache=inference_cache,
+            layer_id=0,
             is_mla=is_mla,
             context_batch_size=context_batch_size,
             block_m=block_m,

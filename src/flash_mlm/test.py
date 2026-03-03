@@ -1,4 +1,4 @@
-from flash_mlm.host import flash_attn_mlm_compressed
+from flash_mlm.host import flash_attn_mlm, flash_attn_mlm_compressed
 from flash_mlm.host_utils import build_pack_metadata, unpack_from_kernel
 from flash_mlm.cache import InferenceCache
 import torch
@@ -95,6 +95,180 @@ def _reference_varlen_attention_with_cache(
             probs = torch.softmax(logits.float(), dim=-1).to(q.dtype)
             out[b, h, :Lq, :] = torch.matmul(probs, v_all)
     return out
+
+
+def _reference_dense_attention_with_flat_cache(
+    q,
+    k,
+    v,
+    k_cache,
+    v_cache,
+    context_len,
+    scale,
+    is_mla,
+    context_batch_size,
+):
+    bsz, n_heads, n_ctx, _ = q.shape
+    out = torch.zeros_like(q)
+    for b in range(bsz):
+        ctx_batch = 0 if context_batch_size == 1 else b
+        for h in range(n_heads):
+            q_bh = q[b, h, :n_ctx, :]
+            if is_mla:
+                k_main = k[b, h, :n_ctx, :]
+                v_main = k_main
+                c_start = ctx_batch * context_len
+                c_end = c_start + context_len
+                k_ctx = k_cache[c_start:c_end, :]
+                v_ctx = k_ctx
+            else:
+                c_start = (ctx_batch * n_heads + h) * context_len
+                c_end = c_start + context_len
+                k_main = k[b, h, :n_ctx, :]
+                v_main = v[b, h, :n_ctx, :]
+                k_ctx = k_cache[c_start:c_end, :]
+                v_ctx = v_cache[c_start:c_end, :]
+
+            k_all = torch.cat([k_ctx, k_main], dim=0)
+            v_all = torch.cat([v_ctx, v_main], dim=0)
+            logits = torch.matmul(q_bh, k_all.transpose(0, 1)) * scale
+            probs = torch.softmax(logits.float(), dim=-1).to(q.dtype)
+            out[b, h, :n_ctx, :] = torch.matmul(probs, v_all)
+    return out
+
+
+@pytest.mark.parametrize("is_mla", [False, True])
+def test_mlm_dense_prefill_requires_cache(is_mla):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    torch.manual_seed(21)
+    B, H, N, D = 2, 2, 16, 64
+    q = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    k = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    v = k if is_mla else torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="prefill=True requires inference_cache"):
+        flash_attn_mlm(
+            q,
+            k,
+            v,
+            scale=0.5,
+            inference_cache=None,
+            layer_id=None,
+            is_mla=is_mla,
+            block_m=32,
+            block_n=32,
+            prefill=True,
+        )
+
+
+@pytest.mark.parametrize("is_mla", [False, True])
+def test_mlm_dense_no_cache_matches_reference(is_mla):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    torch.manual_seed(22)
+    B, H, N, D = 2, 3, 24, 64
+    scale = 0.6
+    q = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    k = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    v = k if is_mla else torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+
+    out = flash_attn_mlm(
+        q,
+        k,
+        v,
+        scale=scale,
+        inference_cache=None,
+        layer_id=None,
+        is_mla=is_mla,
+        block_m=32,
+        block_n=32,
+    )
+
+    empty_rows = 0 if is_mla else H * 0
+    k_cache = torch.empty((empty_rows, D), device=DEVICE, dtype=torch.float16)
+    v_cache = torch.empty_like(k_cache)
+    ref = _reference_dense_attention_with_flat_cache(
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        0,
+        scale,
+        is_mla,
+        context_batch_size=B,
+    )
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=0)
+
+
+@pytest.mark.parametrize("is_mla", [False, True])
+def test_mlm_dense_prefill_then_use_cached_context_matches_reference(is_mla):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    torch.manual_seed(23)
+    B, H, N, D = 2, 2, 20, 64
+    scale = 0.55
+
+    q1 = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    k1 = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    v1 = k1 if is_mla else torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+
+    q2 = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    k2 = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    v2 = k2 if is_mla else torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+
+    cache = InferenceCache()
+    flash_attn_mlm(
+        q1,
+        k1,
+        v1,
+        scale=scale,
+        inference_cache=cache,
+        layer_id=3,
+        is_mla=is_mla,
+        block_m=32,
+        block_n=32,
+        prefill=True,
+    )
+
+    out = flash_attn_mlm(
+        q2,
+        k2,
+        v2,
+        scale=scale,
+        inference_cache=cache,
+        layer_id=3,
+        is_mla=is_mla,
+        context_batch_size=B,
+        block_m=32,
+        block_n=32,
+    )
+
+    entry = cache.get_kv_cache(
+        3,
+        is_mla=is_mla,
+        num_heads=H,
+        head_dim=D,
+        dtype=q2.dtype,
+        device=q2.device,
+    )
+    context_len = entry.total_context_len // entry.context_batch_size
+    ref = _reference_dense_attention_with_flat_cache(
+        q2,
+        k2,
+        v2,
+        entry.k_cache,
+        entry.v_cache,
+        context_len,
+        scale,
+        is_mla,
+        entry.context_batch_size,
+    )
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=0)
 
 
 @pytest.mark.parametrize("is_mla", [False, True])

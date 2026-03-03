@@ -1,13 +1,15 @@
 import torch
 
 import triton
-from triton.tools.tensor_descriptor import TensorDescriptor
 
 from flash_mlm.host_utils import (
     PackMetadata,
+    _maybe_get_cache_context,
     make_contiguous,
+    make_host_desc,
     pack_and_pad_main_tensors_for_mlm_compressed,
     require_cuda_tensors,
+    validate_cache_request,
     validate_cu_seqlens_rank1_min2,
     validate_head_dim_supported,
     validate_packed_cache_shapes,
@@ -24,65 +26,50 @@ from flash_mlm.mlm_kernel import (
 from flash_mlm.cache import InferenceCache
 
 
-def _make_host_desc(x: torch.Tensor, rows: int, head_dim: int) -> TensorDescriptor:
-    return TensorDescriptor(
-        x,
-        shape=[rows, head_dim],
-        strides=[head_dim, 1],
-        block_shape=[1, 1],
-    )
-
-
 def flash_attn_mlm(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    context_len: int,
     scale: float,
+    inference_cache: InferenceCache | None = None,
+    layer_id: int | str | None = None,
     is_mla: bool = False,
     context_batch_size: int | None = None,
-    cu_seqlens_q: torch.Tensor | None = None,
-    cu_seqlens_kv: torch.Tensor | None = None,
     block_m: int = 64,
     block_n: int = 32,
     auto_tune_tiles: bool = False,
+    prefill: bool = False,
 ) -> torch.Tensor:
     """Host launcher for dense (non-packed) MLM attention kernel.
 
     Expected layouts:
       - q, k, v: [B, H, N, D]
-      - k_cache, v_cache: [B_cache, H, C, D], where B_cache is either
-        ``context_batch_size`` or 1 (shared cache across query batch)
+      - cached k_cache, v_cache are flattened rank-2 tensors from
+        ``InferenceCache`` and interpreted as either:
+        - MLA: [total_context_tokens, D]
+        - non-MLA: [H * total_context_tokens, D]
 
     Args:
         q: Query tensor with shape [B, H, N, D].
         k: Key tensor with shape [B, H, N, D].
         v: Value tensor with shape [B, H, N, D].
-        k_cache: Cache K tensor with shape [B_cache, H, C, D].
-        v_cache: Cache V tensor with shape [B_cache, H, C, D].
-        context_len: Active cache length C_active used from k_cache/v_cache.
-            Must satisfy ``0 <= context_len <= C``.
         scale: Softmax scaling factor applied to QK logits.
+        inference_cache: Optional layer-scoped inference cache containing
+            flattened KV context. If omitted, this call runs with empty context.
+        layer_id: Optional layer identifier used with ``inference_cache``.
         is_mla: Whether to run in MLA latent mode.
-        context_batch_size: Number of context sequences represented by
-            cache tensors. If None, inferred from ``k_cache.shape[0]``.
-        cu_seqlens_q: Unused in the dense path. Kept for API compatibility.
-        cu_seqlens_kv: Unused in the dense path. Kept for API compatibility.
+        context_batch_size: Optional override for context batch count when there
+            is no cached entry. If a cached entry exists, this must match it.
         block_m: K/V tile size when ``auto_tune_tiles=False``.
         block_n: Q tile size for kernel launch and grid construction.
         auto_tune_tiles: If True, use autotuned BLOCK_M (BLOCK_N fixed by
             ``block_n``); otherwise use provided ``block_m``/``block_n``.
+        prefill: If True, store this call's dense K/V as the next cached
+            context for ``layer_id``.
 
     Returns:
         Output tensor with shape [B, H, N, D] on the same device/dtype as ``q``.
     """
-
-    require_cuda_tensors(q, k, v, k_cache, v_cache)
-
-    if k_cache.ndim != 4 or v_cache.ndim != 4:
-        raise ValueError("k_cache/v_cache must be rank-4 tensors [B, H, C, D]")
 
     b, h, n, d = validate_qkv_same_shape_rank4(
         q,
@@ -90,24 +77,35 @@ def flash_attn_mlm(
         v,
         error_prefix="q/k/v",
     )
-    bc, hc, c, dc = k_cache.shape
-    if (hc, dc) != (h, d):
-        raise ValueError("k_cache shape must have H/D matching q")
-    if v_cache.shape != k_cache.shape:
-        raise ValueError("v_cache shape must match k_cache shape")
 
-    if context_batch_size is None:
-        context_batch_size = bc
-    if context_batch_size < 1:
+    validate_cache_request(
+        prefill=prefill,
+        inference_cache=inference_cache,
+        layer_id=layer_id,
+    )
+
+    use_layer_cache = inference_cache is not None
+    cache_ctx = _maybe_get_cache_context(
+        inference_cache=inference_cache,
+        layer_id=layer_id,
+        batch_size=b,
+        is_mla=is_mla,
+        num_heads=h,
+        head_dim=d,
+        context_batch_size=context_batch_size,
+        dtype=q.dtype,
+        device=q.device,
+        compressed=False,
+    )
+
+    k_cache = cache_ctx.k_cache
+    v_cache = cache_ctx.v_cache
+    context_batch_size = cache_ctx.context_batch_size
+    context_len = cache_ctx.context_len
+
+    require_cuda_tensors(q, k, v, k_cache, v_cache)
+    if context_batch_size is None or context_batch_size < 1:
         raise ValueError("context_batch_size must be >= 1")
-    if bc not in (1, context_batch_size):
-        raise ValueError("k_cache batch dim must be 1 or match context_batch_size")
-
-    if context_len < 0 or context_len > c:
-        raise ValueError("context_len must be in [0, k_cache.shape[2]]")
-
-    # Kept for API compatibility with compressed path / future varlen main path.
-    _ = (cu_seqlens_q, cu_seqlens_kv)
 
     validate_head_dim_supported(d)
 
@@ -122,12 +120,12 @@ def flash_attn_mlm(
             if is_mla
             else context_batch_size * h * context_len
         )
-        desc_q = _make_host_desc(q, y_dim, d)
-        desc_k = _make_host_desc(k, y_dim, d)
-        desc_v = _make_host_desc(v, y_dim, d)
-        desc_o = _make_host_desc(out, y_dim, d)
-        desc_k_cache = _make_host_desc(k_cache, y_dim_context, d)
-        desc_v_cache = _make_host_desc(v_cache, y_dim_context, d)
+        desc_q = make_host_desc(q, y_dim, d)
+        desc_k = make_host_desc(k, y_dim, d)
+        desc_v = make_host_desc(v, y_dim, d)
+        desc_o = make_host_desc(out, y_dim, d)
+        desc_k_cache = make_host_desc(k_cache, y_dim_context, d)
+        desc_v_cache = make_host_desc(v_cache, y_dim_context, d)
     else:
         desc_q = q
         desc_k = k
@@ -174,6 +172,25 @@ def flash_attn_mlm(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             HEAD_DIM=d,
+        )
+
+    if prefill and use_layer_cache:
+        # Dense prefill stores flattened K/V with uniform per-batch context len n.
+        if is_mla:
+            k_prefill = k[:, 0, :, :].contiguous().view(b * n, d)
+            v_prefill = k_prefill
+        else:
+            k_prefill = k.contiguous().view(b * h * n, d)
+            v_prefill = v.contiguous().view(b * h * n, d)
+
+        inference_cache.prefill_kv_cache(
+            layer_id,
+            k_cache=k_prefill,
+            v_cache=v_prefill,
+            context_batch_size=int(b),
+            is_mla=is_mla,
+            num_heads=h,
+            head_dim=d,
         )
 
     return out
@@ -240,13 +257,11 @@ def flash_attn_mlm_compressed(
     if h != num_heads:
         raise ValueError("q/k/v head dimension must match num_heads")
 
-    if prefill and inference_cache is None:
-        raise ValueError("prefill=True requires inference_cache")
-
-    if (inference_cache is None) != (layer_id is None):
-        raise ValueError(
-            "inference_cache and layer_id must be provided together or both omitted"
-        )
+    validate_cache_request(
+        prefill=prefill,
+        inference_cache=inference_cache,
+        layer_id=layer_id,
+    )
 
     if q_meta.B != b or q_meta.N != n:
         raise ValueError("q_meta shape metadata does not match q/k/v padded shape")
@@ -257,41 +272,25 @@ def flash_attn_mlm_compressed(
         raise ValueError("q_meta was built with different block_n")
     cu_seqlens_q = q_meta.cu_seqlens
 
-    use_layer_cache = inference_cache is not None and layer_id is not None
-    entry = None
-    if use_layer_cache:
-        try:
-            entry = inference_cache.get_kv_cache(
-                layer_id,
-                is_mla=is_mla,
-                num_heads=num_heads,
-                head_dim=d,
-                dtype=q.dtype,
-                device=q.device,
-            )
-        except ValueError:
-            # Missing or incompatible cache entry falls back to empty context.
-            entry = None
+    use_layer_cache = inference_cache is not None
+    cache_ctx = _maybe_get_cache_context(
+        inference_cache=inference_cache,
+        layer_id=layer_id,
+        batch_size=b,
+        is_mla=is_mla,
+        num_heads=num_heads,
+        head_dim=d,
+        context_batch_size=context_batch_size,
+        dtype=q.dtype,
+        device=q.device,
+        compressed=True,
+    )
 
-    if entry is None:
-        # First prefill call can run without pre-existing context cache.
-        total_context_len = 0
-        context_batch_size = b if context_batch_size is None else context_batch_size
-        cu_seqlens_kv = torch.zeros(
-            context_batch_size + 1,
-            device=q.device,
-            dtype=torch.int32,
-        )
-        kv_rows = total_context_len if is_mla else num_heads * total_context_len
-        k_cache = torch.empty((kv_rows, d), device=q.device, dtype=q.dtype)
-        v_cache = torch.empty_like(k_cache)
-    else:
-        k_cache = entry.k_cache
-        v_cache = entry.v_cache
-        total_context_len = entry.total_context_len
-        cu_seqlens_kv = entry.cu_seqlens_kv
-        if context_batch_size is None:
-            context_batch_size = entry.context_batch_size
+    k_cache = cache_ctx.k_cache
+    v_cache = cache_ctx.v_cache
+    total_context_len = cache_ctx.total_context_len
+    cu_seqlens_kv = cache_ctx.cu_seqlens_kv
+    context_batch_size = cache_ctx.context_batch_size
 
     require_cuda_tensors(q, k, v, k_cache, v_cache, cu_seqlens_kv)
 
@@ -412,12 +411,12 @@ def flash_attn_mlm_compressed(
         y_dim_q = num_heads * total_q_len
         y_dim_kv_main = total_q_len if is_mla else num_heads * total_q_len
         y_dim_context = total_context_len if is_mla else num_heads * total_context_len
-        desc_q = _make_host_desc(q, y_dim_q, d)
-        desc_k = _make_host_desc(k, y_dim_kv_main, d)
-        desc_v = _make_host_desc(v, y_dim_kv_main, d)
-        desc_o = _make_host_desc(out, y_dim_q, d)
-        desc_k_cache = _make_host_desc(k_cache, y_dim_context, d)
-        desc_v_cache = _make_host_desc(v_cache, y_dim_context, d)
+        desc_q = make_host_desc(q, y_dim_q, d)
+        desc_k = make_host_desc(k, y_dim_kv_main, d)
+        desc_v = make_host_desc(v, y_dim_kv_main, d)
+        desc_o = make_host_desc(out, y_dim_q, d)
+        desc_k_cache = make_host_desc(k_cache, y_dim_context, d)
+        desc_v_cache = make_host_desc(v_cache, y_dim_context, d)
     else:
         desc_q = q
         desc_k = k

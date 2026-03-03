@@ -2,9 +2,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from triton.tools.tensor_descriptor import TensorDescriptor
+
+from flash_mlm.cache import InferenceCache
 
 if TYPE_CHECKING:
-    from flash_mlm.cache import PackingCache
+    from flash_mlm.cache import LayerKVEntry, PackingCache
 
 
 @dataclass
@@ -20,6 +23,16 @@ class PackMetadata:
     batch_ids_block_n: int  # BLOCK_N
     batch_ids_q: torch.Tensor  # (num_q_tiles,) tile-to-batch mapping
     q_tile_starts_q: torch.Tensor  # (num_q_tiles,) packed query start offsets
+
+
+@dataclass
+class CacheContext:
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    context_batch_size: int
+    context_len: int
+    total_context_len: int
+    cu_seqlens_kv: torch.Tensor | None
 
 
 def build_pack_metadata(lengths: torch.Tensor, N: int, block_n: int) -> PackMetadata:
@@ -126,6 +139,130 @@ def num_query_tiles_from_cu_seqlens(cu_seqlens_q: torch.Tensor, block_n: int) ->
 def num_query_tiles_from_meta(meta: PackMetadata) -> int:
     """Return number of precomputed per-batch query tiles stored in metadata."""
     return int(meta.q_tile_starts_q.numel())
+
+
+def make_host_desc(x: torch.Tensor, rows: int, head_dim: int) -> TensorDescriptor:
+    return TensorDescriptor(
+        x,
+        shape=[rows, head_dim],
+        strides=[head_dim, 1],
+        block_shape=[1, 1],
+    )
+
+
+def validate_cache_request(
+    *,
+    prefill: bool,
+    inference_cache: InferenceCache | None,
+    layer_id: int | str | None,
+) -> None:
+    if prefill and inference_cache is None:
+        raise ValueError("prefill=True requires inference_cache")
+    if (inference_cache is None) != (layer_id is None):
+        raise ValueError(
+            "inference_cache and layer_id must be provided together or both omitted"
+        )
+
+
+def _maybe_get_cache_context(
+    *,
+    inference_cache: InferenceCache | None,
+    layer_id: int | str | None,
+    batch_size: int,
+    num_heads: int,
+    head_dim: int,
+    is_mla: bool,
+    context_batch_size: int | None,
+    device: torch.device,
+    dtype: torch.dtype,
+    compressed: bool,
+):
+    entry: "LayerKVEntry | None" = None
+    if inference_cache is not None:
+        try:
+            entry = inference_cache.get_kv_cache(
+                layer_id,
+                is_mla=is_mla,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                device=device,
+            )
+        except ValueError:
+            entry = None
+
+    context_len = 0
+    if entry is None:
+        resolved_context_batch_size = (
+            batch_size if context_batch_size is None else context_batch_size
+        )
+        total_context_len = 0
+        kv_rows = total_context_len if is_mla else num_heads * total_context_len
+        k_cache = torch.empty((kv_rows, head_dim), device=device, dtype=dtype)
+        v_cache = torch.empty_like(k_cache)
+        cu_seqlens_kv = (
+            torch.zeros(
+                resolved_context_batch_size + 1,
+                device=device,
+                dtype=torch.int32,
+            )
+            if compressed
+            else None
+        )
+
+    else:
+        k_cache = entry.k_cache
+        v_cache = entry.v_cache
+
+        resolved_context_batch_size = entry.context_batch_size
+        if (
+            context_batch_size is not None
+            and context_batch_size != resolved_context_batch_size
+        ):
+            raise ValueError(
+                "context_batch_size must match cached entry context_batch_size"
+            )
+        if resolved_context_batch_size < 1:
+            raise ValueError("context_batch_size must be >= 1")
+
+        total_context_len = int(entry.total_context_len)
+        if compressed:
+            cu_seqlens_kv = entry.cu_seqlens_kv
+            if cu_seqlens_kv is None:
+                if total_context_len % resolved_context_batch_size != 0:
+                    raise ValueError(
+                        "compressed path requires cu_seqlens_kv or uniform per-batch context lengths"
+                    )
+                context_len = total_context_len // resolved_context_batch_size
+                cu_seqlens_kv = torch.arange(
+                    resolved_context_batch_size + 1,
+                    device=device,
+                    dtype=torch.int32,
+                ) * int(context_len)
+        else:
+            cu_seqlens_kv = None
+            if total_context_len % resolved_context_batch_size != 0:
+                raise ValueError(
+                    "dense flash_attn_mlm requires uniform per-batch context lengths"
+                )
+
+            context_len = total_context_len // resolved_context_batch_size
+            expected_rows = (
+                total_context_len if is_mla else num_heads * total_context_len
+            )
+            if k_cache.shape[0] != expected_rows or v_cache.shape[0] != expected_rows:
+                raise ValueError(
+                    "cached dense k/v rows mismatch expected layout for is_mla/num_heads"
+                )
+
+    return CacheContext(
+        k_cache=k_cache,
+        v_cache=v_cache,
+        context_batch_size=resolved_context_batch_size,
+        context_len=context_len,
+        total_context_len=total_context_len,
+        cu_seqlens_kv=cu_seqlens_kv,
+    )
 
 
 def pack_for_kernel(

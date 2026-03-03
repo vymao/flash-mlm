@@ -68,7 +68,7 @@ class LayerKVEntry:
     k_cache: torch.Tensor
     v_cache: torch.Tensor
     total_context_len: int
-    cu_seqlens_kv: torch.Tensor
+    cu_seqlens_kv: torch.Tensor | None
     context_batch_size: int
     is_mla: bool
     num_heads: int
@@ -89,6 +89,29 @@ class InferenceCache:
         return str(layer_id)
 
     @staticmethod
+    def _validate_kv_common_inputs(
+        *,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        total_context_len: int,
+        is_mla: bool,
+        num_heads: int,
+        head_dim: int,
+    ) -> None:
+        if k_cache.ndim != 2 or v_cache.ndim != 2:
+            raise ValueError("k_cache/v_cache must be rank-2 packed tensors")
+        if v_cache.shape != k_cache.shape:
+            raise ValueError("v_cache shape must match k_cache shape")
+        if k_cache.shape[1] != head_dim:
+            raise ValueError("k_cache/v_cache second dim must match head_dim")
+        expected_rows = total_context_len if is_mla else num_heads * total_context_len
+        if k_cache.shape[0] != expected_rows:
+            raise ValueError(
+                "k_cache/v_cache first dim mismatch: expected "
+                f"{expected_rows} rows for is_mla={is_mla}"
+            )
+
+    @staticmethod
     def _validate_kv_entry_inputs(
         *,
         k_cache: torch.Tensor,
@@ -100,10 +123,14 @@ class InferenceCache:
         num_heads: int,
         head_dim: int,
     ) -> None:
-        if k_cache.ndim != 2 or v_cache.ndim != 2:
-            raise ValueError("k_cache/v_cache must be rank-2 packed tensors")
-        if v_cache.shape != k_cache.shape:
-            raise ValueError("v_cache shape must match k_cache shape")
+        InferenceCache._validate_kv_common_inputs(
+            k_cache=k_cache,
+            v_cache=v_cache,
+            total_context_len=total_context_len,
+            is_mla=is_mla,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
         if cu_seqlens_kv.ndim != 1 or cu_seqlens_kv.numel() < 2:
             raise ValueError("cu_seqlens_kv must be rank-1 with at least 2 elements")
         if context_batch_size < 1:
@@ -112,14 +139,6 @@ class InferenceCache:
             raise ValueError(
                 "context_batch_size is incompatible with cu_seqlens_kv length"
             )
-        if k_cache.shape[1] != head_dim:
-            raise ValueError("k_cache/v_cache second dim must match head_dim")
-        expected_rows = total_context_len if is_mla else num_heads * total_context_len
-        if k_cache.shape[0] != expected_rows:
-            raise ValueError(
-                "k_cache/v_cache first dim mismatch: expected "
-                f"{expected_rows} rows for is_mla={is_mla}"
-            )
 
     def prefill_kv_cache(
         self,
@@ -127,31 +146,64 @@ class InferenceCache:
         *,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        total_context_len: int,
-        cu_seqlens_kv: torch.Tensor,
+        total_context_len: int | None = None,
+        cu_seqlens_kv: torch.Tensor | None = None,
         context_batch_size: int,
         is_mla: bool,
         num_heads: int,
         head_dim: int,
     ) -> None:
         """Store pre-packed KV cache buffers for a layer without copying."""
-        self._validate_kv_entry_inputs(
-            k_cache=k_cache,
-            v_cache=v_cache,
-            total_context_len=total_context_len,
-            cu_seqlens_kv=cu_seqlens_kv,
-            context_batch_size=context_batch_size,
-            is_mla=is_mla,
-            num_heads=num_heads,
-            head_dim=head_dim,
-        )
+        if context_batch_size < 1:
+            raise ValueError("context_batch_size must be >= 1")
+        if num_heads < 1:
+            raise ValueError("num_heads must be >= 1")
+
+        if total_context_len is None:
+            if is_mla:
+                total_context_len = int(k_cache.shape[0])
+            else:
+                if k_cache.shape[0] % num_heads != 0:
+                    raise ValueError(
+                        "non-MLA k_cache rows must be divisible by num_heads"
+                    )
+                total_context_len = int(k_cache.shape[0] // num_heads)
+        else:
+            total_context_len = int(total_context_len)
+
+        if cu_seqlens_kv is None:
+            self._validate_kv_common_inputs(
+                k_cache=k_cache,
+                v_cache=v_cache,
+                total_context_len=total_context_len,
+                is_mla=is_mla,
+                num_heads=num_heads,
+                head_dim=head_dim,
+            )
+            if total_context_len % context_batch_size != 0:
+                raise ValueError(
+                    "when cu_seqlens_kv is omitted, total_context_len must be divisible by context_batch_size"
+                )
+        else:
+            self._validate_kv_entry_inputs(
+                k_cache=k_cache,
+                v_cache=v_cache,
+                total_context_len=total_context_len,
+                cu_seqlens_kv=cu_seqlens_kv,
+                context_batch_size=context_batch_size,
+                is_mla=is_mla,
+                num_heads=num_heads,
+                head_dim=head_dim,
+            )
 
         layer_key = self._layer_key(layer_id)
         self._layer_kv[layer_key] = LayerKVEntry(
             k_cache=k_cache,
             v_cache=v_cache,
             total_context_len=int(total_context_len),
-            cu_seqlens_kv=cu_seqlens_kv.contiguous(),
+            cu_seqlens_kv=(
+                cu_seqlens_kv.contiguous() if cu_seqlens_kv is not None else None
+            ),
             context_batch_size=int(context_batch_size),
             is_mla=bool(is_mla),
             num_heads=int(num_heads),

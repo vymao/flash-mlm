@@ -1,6 +1,6 @@
 [project]
 name = "flash-mlm"
-version = "1.0.0"
+version = "1.0.4"
 description = "Triton-based Flash MLM attention kernels for PyTorch"
 readme = "README.md"
 authors = [

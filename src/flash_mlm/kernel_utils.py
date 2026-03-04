@@ -5,12 +5,19 @@ import triton
 import triton.language as tl
 
 
+def _get_triton_backend() -> str | None:
+    try:
+        return triton.runtime.driver.active.get_current_target().backend
+    except RuntimeError:
+        return None
+
+
 def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
+    return _get_triton_backend() == "hip"
 
 
 def is_cuda():
-    return triton.runtime.driver.active.get_current_target().backend == "cuda"
+    return _get_triton_backend() == "cuda"
 
 
 def supports_host_descriptor():

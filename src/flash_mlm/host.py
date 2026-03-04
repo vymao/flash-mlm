@@ -406,6 +406,13 @@ def flash_attn_mlm_compressed(
 
     out = torch.empty_like(q)
     grid = (num_q_tiles, num_heads, 1)
+    workload = max(int(total_q_len), int(total_context_len))
+    if workload <= 256:
+        workload_bucket = 0
+    elif workload <= 1024:
+        workload_bucket = 1
+    else:
+        workload_bucket = 2
 
     if supports_host_descriptor():
         y_dim_q = num_heads * total_q_len
@@ -438,6 +445,7 @@ def flash_attn_mlm_compressed(
             total_context_len,
             scale,
             total_q_len,
+            workload_bucket,
             batch_ids_q,
             q_tile_starts_q,
             cu_seqlens_q,
@@ -460,6 +468,7 @@ def flash_attn_mlm_compressed(
             total_context_len,
             scale,
             total_q_len,
+            workload_bucket,
             batch_ids_q,
             q_tile_starts_q,
             cu_seqlens_q,

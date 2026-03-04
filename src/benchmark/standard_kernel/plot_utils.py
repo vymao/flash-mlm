@@ -7,6 +7,7 @@ def _plot_metric(
     rows: list[dict],
     *,
     standard_key: str,
+    sdpa_key: str,
     noncompressed_key: str,
     compressed_key: str,
     ylabel: str,
@@ -16,19 +17,30 @@ def _plot_metric(
     labels = [row["section"] for row in rows]
     x = list(range(len(rows)))
     standard_vals = [row[standard_key] for row in rows]
+    sdpa_vals = [row[sdpa_key] for row in rows]
     noncompressed_vals = [row[noncompressed_key] for row in rows]
     compressed_vals = [row[compressed_key] for row in rows]
-    width = 0.26
+    width = 0.2
 
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.bar(
-        [i - width for i in x], standard_vals, width=width, label="Standard Attention"
+        [i - 1.5 * width for i in x],
+        standard_vals,
+        width=width,
+        label="Standard Attention",
+    )
+    ax.bar([i - 0.5 * width for i in x], sdpa_vals, width=width, label="PyTorch SDPA")
+    ax.bar(
+        [i + 0.5 * width for i in x],
+        noncompressed_vals,
+        width=width,
+        label="Non-Compressed Kernel",
     )
     ax.bar(
-        [i for i in x], noncompressed_vals, width=width, label="Non-Compressed Kernel"
-    )
-    ax.bar(
-        [i + width for i in x], compressed_vals, width=width, label="Compressed Kernel"
+        [i + 1.5 * width for i in x],
+        compressed_vals,
+        width=width,
+        label="Compressed Kernel",
     )
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=20, ha="right")
@@ -55,18 +67,40 @@ def write_benchmark_bar_plots(
     _plot_metric(
         rows,
         standard_key="standard_ms",
+        sdpa_key="sdpa_ms",
         noncompressed_key="noncompressed_ms",
         compressed_key="compressed_ms",
         ylabel="Latency (ms)",
         title=f"Attention latency by section ({title_suffix})",
-        out_path=plots_dir / "mlm-threeway-latency.png",
+        out_path=plots_dir / "mlm-fourway-latency.png",
     )
     _plot_metric(
         rows,
         standard_key="standard_tflops",
+        sdpa_key="sdpa_tflops",
         noncompressed_key="noncompressed_tflops",
         compressed_key="compressed_tflops",
         ylabel="Estimated TFLOPS",
         title=f"Attention TFLOPS by section ({title_suffix})",
-        out_path=plots_dir / "mlm-threeway-tflops.png",
+        out_path=plots_dir / "mlm-fourway-tflops.png",
+    )
+    _plot_metric(
+        rows,
+        standard_key="standard_peak_alloc_mb",
+        sdpa_key="sdpa_peak_alloc_mb",
+        noncompressed_key="noncompressed_peak_alloc_mb",
+        compressed_key="compressed_peak_alloc_mb",
+        ylabel="Peak CUDA memory allocated delta (MB)",
+        title=f"Attention peak allocated memory by section ({title_suffix})",
+        out_path=plots_dir / "mlm-fourway-peak-alloc-mb.png",
+    )
+    _plot_metric(
+        rows,
+        standard_key="standard_peak_reserved_mb",
+        sdpa_key="sdpa_peak_reserved_mb",
+        noncompressed_key="noncompressed_peak_reserved_mb",
+        compressed_key="compressed_peak_reserved_mb",
+        ylabel="Peak CUDA memory reserved (MB)",
+        title=f"Attention peak reserved memory by section ({title_suffix})",
+        out_path=plots_dir / "mlm-fourway-peak-reserved-mb.png",
     )

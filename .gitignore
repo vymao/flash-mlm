@@ -7,3 +7,6 @@ plots/
 *.pyc
 *.pyo
 *.pyd
+
+# No NCU plots
+ncu*

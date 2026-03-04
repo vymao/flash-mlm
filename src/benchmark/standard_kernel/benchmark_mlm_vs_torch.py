@@ -16,9 +16,12 @@ from flash_mlm.host_utils import unpack_from_kernel  # noqa: E402
 from benchmark.standard_kernel.utils import (  # noqa: E402
     _build_shared_inputs,
     _estimate_tflops,
+    _measure_peak_cuda_memory_mb,
     _reference_dense_attention_with_cache,
     _reference_varlen_attention_with_cache,
     _resolve_padded_len,
+    _sdpa_dense_attention_with_cache,
+    _sdpa_varlen_attention_with_cache,
 )
 from benchmark.standard_kernel.plot_utils import (
     write_benchmark_bar_plots,
@@ -95,7 +98,22 @@ def _bench_noncompressed(
             v_tensor,
             payload["k_cache_dense"],
             payload["v_cache_dense"],
-            context_len_active,
+            payload["lengths_q_dense"],
+            payload["lengths_kv_dense"],
+            payload["scale"],
+            is_mla,
+            context_batch_size,
+        )
+
+    def _sdpa_fn():
+        return _sdpa_dense_attention_with_cache(
+            payload["q"],
+            payload["k"],
+            v_tensor,
+            payload["k_cache_dense"],
+            payload["v_cache_dense"],
+            payload["lengths_q_dense"],
+            payload["lengths_kv_dense"],
             payload["scale"],
             is_mla,
             context_batch_size,
@@ -106,6 +124,7 @@ def _bench_noncompressed(
 
     flash_ms = triton.testing.do_bench(_flash_fn)
     baseline_ms = triton.testing.do_bench(_torch_fn)
+    sdpa_ms = triton.testing.do_bench(_sdpa_fn)
     flash_tflops = _estimate_tflops(
         payload["lengths_q_dense"],
         payload["lengths_kv_dense"],
@@ -120,7 +139,35 @@ def _bench_noncompressed(
         head_dim,
         baseline_ms,
     )
-    return flash_ms, baseline_ms, flash_tflops, baseline_tflops
+    sdpa_tflops = _estimate_tflops(
+        payload["lengths_q_dense"],
+        payload["lengths_kv_dense"],
+        num_heads,
+        head_dim,
+        sdpa_ms,
+    )
+
+    flash_peak_alloc_mb, flash_peak_reserved_mb = _measure_peak_cuda_memory_mb(
+        _flash_fn
+    )
+    baseline_peak_alloc_mb, baseline_peak_reserved_mb = _measure_peak_cuda_memory_mb(
+        _torch_fn
+    )
+    sdpa_peak_alloc_mb, sdpa_peak_reserved_mb = _measure_peak_cuda_memory_mb(_sdpa_fn)
+    return (
+        flash_ms,
+        baseline_ms,
+        sdpa_ms,
+        flash_tflops,
+        baseline_tflops,
+        sdpa_tflops,
+        flash_peak_alloc_mb,
+        flash_peak_reserved_mb,
+        baseline_peak_alloc_mb,
+        baseline_peak_reserved_mb,
+        sdpa_peak_alloc_mb,
+        sdpa_peak_reserved_mb,
+    )
 
 
 def _bench_compressed(
@@ -186,6 +233,20 @@ def _bench_compressed(
             context_batch_size,
         )
 
+    def _sdpa_fn():
+        return _sdpa_varlen_attention_with_cache(
+            payload["q"],
+            payload["k"],
+            payload["v"],
+            payload["lengths_q_varlen"],
+            k_cache,
+            v_cache,
+            payload["cu_seqlens_kv"],
+            payload["scale"],
+            is_mla,
+            context_batch_size,
+        )
+
     if check_correctness:
         packed_out = _flash_fn()
         out = unpack_from_kernel(packed_out, payload["q_meta"], H=num_heads)
@@ -194,6 +255,7 @@ def _bench_compressed(
 
     flash_ms = triton.testing.do_bench(_flash_fn)
     baseline_ms = triton.testing.do_bench(_torch_fn)
+    sdpa_ms = triton.testing.do_bench(_sdpa_fn)
     flash_tflops = _estimate_tflops(
         payload["lengths_q_varlen"],
         payload["lengths_kv_varlen"],
@@ -208,7 +270,35 @@ def _bench_compressed(
         head_dim,
         baseline_ms,
     )
-    return flash_ms, baseline_ms, flash_tflops, baseline_tflops
+    sdpa_tflops = _estimate_tflops(
+        payload["lengths_q_varlen"],
+        payload["lengths_kv_varlen"],
+        num_heads,
+        head_dim,
+        sdpa_ms,
+    )
+
+    flash_peak_alloc_mb, flash_peak_reserved_mb = _measure_peak_cuda_memory_mb(
+        _flash_fn
+    )
+    baseline_peak_alloc_mb, baseline_peak_reserved_mb = _measure_peak_cuda_memory_mb(
+        _torch_fn
+    )
+    sdpa_peak_alloc_mb, sdpa_peak_reserved_mb = _measure_peak_cuda_memory_mb(_sdpa_fn)
+    return (
+        flash_ms,
+        baseline_ms,
+        sdpa_ms,
+        flash_tflops,
+        baseline_tflops,
+        sdpa_tflops,
+        flash_peak_alloc_mb,
+        flash_peak_reserved_mb,
+        baseline_peak_alloc_mb,
+        baseline_peak_reserved_mb,
+        sdpa_peak_alloc_mb,
+        sdpa_peak_reserved_mb,
+    )
 
 
 def _bench_scenarios_for_context(
@@ -267,7 +357,20 @@ def _bench_scenarios_for_context(
             dtype=torch.float16,
         )
 
-        noncompressed_ms, _, noncompressed_tflops, _ = _bench_noncompressed(
+        (
+            noncompressed_ms,
+            _,
+            _,
+            noncompressed_tflops,
+            _,
+            _,
+            noncompressed_peak_alloc_mb,
+            noncompressed_peak_reserved_mb,
+            _,
+            _,
+            _,
+            _,
+        ) = _bench_noncompressed(
             payload=payload,
             is_mla=is_mla,
             num_heads=num_heads,
@@ -279,18 +382,29 @@ def _bench_scenarios_for_context(
             auto_tune_tiles=auto_tune_tiles,
             check_correctness=check_correctness,
         )
-        compressed_ms, standard_ms, compressed_tflops, standard_tflops = (
-            _bench_compressed(
-                payload=payload,
-                is_mla=is_mla,
-                num_heads=num_heads,
-                head_dim=section_head_dim,
-                context_batch_size=section_context_batch_size,
-                block_m=block_m,
-                block_n=block_n,
-                auto_tune_tiles=auto_tune_tiles,
-                check_correctness=check_correctness,
-            )
+        (
+            compressed_ms,
+            standard_ms,
+            sdpa_ms,
+            compressed_tflops,
+            standard_tflops,
+            sdpa_tflops,
+            compressed_peak_alloc_mb,
+            compressed_peak_reserved_mb,
+            standard_peak_alloc_mb,
+            standard_peak_reserved_mb,
+            sdpa_peak_alloc_mb,
+            sdpa_peak_reserved_mb,
+        ) = _bench_compressed(
+            payload=payload,
+            is_mla=is_mla,
+            num_heads=num_heads,
+            head_dim=section_head_dim,
+            context_batch_size=section_context_batch_size,
+            block_m=block_m,
+            block_n=block_n,
+            auto_tune_tiles=auto_tune_tiles,
+            check_correctness=check_correctness,
         )
 
         mean_context_subseq_len = (
@@ -308,11 +422,21 @@ def _bench_scenarios_for_context(
                 "has_cache": has_cache,
                 "section": section,
                 "standard_ms": standard_ms,
+                "sdpa_ms": sdpa_ms,
                 "noncompressed_ms": noncompressed_ms,
                 "compressed_ms": compressed_ms,
                 "standard_tflops": standard_tflops,
+                "sdpa_tflops": sdpa_tflops,
                 "noncompressed_tflops": noncompressed_tflops,
                 "compressed_tflops": compressed_tflops,
+                "standard_peak_alloc_mb": standard_peak_alloc_mb,
+                "sdpa_peak_alloc_mb": sdpa_peak_alloc_mb,
+                "noncompressed_peak_alloc_mb": noncompressed_peak_alloc_mb,
+                "compressed_peak_alloc_mb": compressed_peak_alloc_mb,
+                "standard_peak_reserved_mb": standard_peak_reserved_mb,
+                "sdpa_peak_reserved_mb": sdpa_peak_reserved_mb,
+                "noncompressed_peak_reserved_mb": noncompressed_peak_reserved_mb,
+                "compressed_peak_reserved_mb": compressed_peak_reserved_mb,
             }
         )
     return rows
@@ -322,26 +446,64 @@ def _print_results(rows: list[dict], *, context_len: int):
     print("\n=== attention benchmark by section ===")
     print(f"context_len={context_len}")
     print(
-        "{:<22} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}".format(
+        "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}".format(
             "SECTION",
             "STD_MS",
+            "SDPA_MS",
             "NONC_MS",
             "COMP_MS",
             "STD_TF",
+            "SDPA_TF",
             "NONC_TF",
             "COMP_TF",
         )
     )
     for row in rows:
         print(
-            "{:<22} {:>12.4f} {:>12.4f} {:>12.4f} {:>12.2f} {:>12.2f} {:>12.2f}".format(
+            "{:<22} {:>10.4f} {:>10.4f} {:>10.4f} {:>10.4f} {:>10.2f} {:>10.2f} {:>10.2f} {:>10.2f}".format(
                 row["section"],
                 row["standard_ms"],
+                row["sdpa_ms"],
                 row["noncompressed_ms"],
                 row["compressed_ms"],
                 row["standard_tflops"],
+                row["sdpa_tflops"],
                 row["noncompressed_tflops"],
                 row["compressed_tflops"],
+            )
+        )
+
+    print("\nPeak CUDA memory allocated delta (MB)")
+    print(
+        "{:<22} {:>10} {:>10} {:>10} {:>10}".format(
+            "SECTION", "STD_ALLOC", "SDPA_ALLOC", "NONC_ALLOC", "COMP_ALLOC"
+        )
+    )
+    for row in rows:
+        print(
+            "{:<22} {:>10.1f} {:>10.1f} {:>10.1f} {:>10.1f}".format(
+                row["section"],
+                row["standard_peak_alloc_mb"],
+                row["sdpa_peak_alloc_mb"],
+                row["noncompressed_peak_alloc_mb"],
+                row["compressed_peak_alloc_mb"],
+            )
+        )
+
+    print("\nPeak CUDA memory reserved (MB)")
+    print(
+        "{:<22} {:>10} {:>10} {:>10} {:>10}".format(
+            "SECTION", "STD_RES", "SDPA_RES", "NONC_RES", "COMP_RES"
+        )
+    )
+    for row in rows:
+        print(
+            "{:<22} {:>10.1f} {:>10.1f} {:>10.1f} {:>10.1f}".format(
+                row["section"],
+                row["standard_peak_reserved_mb"],
+                row["sdpa_peak_reserved_mb"],
+                row["noncompressed_peak_reserved_mb"],
+                row["compressed_peak_reserved_mb"],
             )
         )
 
@@ -351,8 +513,8 @@ def main():
         description=(
             "Benchmark six sections (non-MLA/MLA x non-cache/single-cache/full-cache) "
             "and report "
-            "three bars per section: standard attention, non-compressed kernel, "
-            "compressed kernel."
+            "four bars per section: standard attention, PyTorch SDPA, "
+            "non-compressed kernel, compressed kernel."
         )
     )
     parser.add_argument("--batch-size", type=int, default=100)

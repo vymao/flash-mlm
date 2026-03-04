@@ -1,6 +1,7 @@
 import math
 
 import torch
+import torch.nn.functional as F
 
 from flash_mlm.host_utils import build_pack_metadata, pack_for_kernel
 
@@ -58,6 +59,29 @@ def _estimate_tflops(
     return total_flops * 1e-12 / (latency_ms * 1e-3)
 
 
+def _measure_peak_cuda_memory_mb(fn, *, iters: int = 3) -> tuple[float, float]:
+    if iters < 1:
+        raise ValueError("iters must be >= 1")
+
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    baseline_alloc = torch.cuda.memory_allocated()
+    baseline_reserved = torch.cuda.memory_reserved()
+
+    for _ in range(iters):
+        _ = fn()
+
+    torch.cuda.synchronize()
+    peak_alloc = torch.cuda.max_memory_allocated()
+    peak_reserved = torch.cuda.max_memory_reserved()
+    mb = float(1024 * 1024)
+    return (
+        max(0.0, float(peak_alloc - baseline_alloc) / mb),
+        float(peak_reserved) / mb,
+    )
+
+
 def _reference_varlen_attention_with_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -71,6 +95,7 @@ def _reference_varlen_attention_with_cache(
     context_batch_size: int,
 ) -> torch.Tensor:
     bsz, n_heads, _, _ = q.shape
+    head_dim = q.shape[-1]
     total_context_len = int(cu_seqlens_kv[-1].item())
     out = torch.zeros_like(q)
     for b in range(bsz):
@@ -102,39 +127,163 @@ def _reference_varlen_attention_with_cache(
     return out
 
 
+def _sdpa_varlen_attention_with_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lengths_q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    scale: float,
+    is_mla: bool,
+    context_batch_size: int,
+) -> torch.Tensor:
+    bsz, n_heads, _, _ = q.shape
+    head_dim = q.shape[-1]
+    total_context_len = int(cu_seqlens_kv[-1].item())
+    out = torch.zeros_like(q)
+    for b in range(bsz):
+        lq = int(lengths_q[b].item())
+        if lq == 0:
+            continue
+        ctx_batch = 0 if context_batch_size == 1 else b
+        c_start = int(cu_seqlens_kv[ctx_batch].item())
+        c_end = int(cu_seqlens_kv[ctx_batch + 1].item())
+
+        q_bh = q[b, :, :lq, :]
+        if is_mla:
+            k_main = k[b, :, :lq, :]
+            v_main = k_main
+            k_ctx = k_cache[c_start:c_end, :].unsqueeze(0).expand(n_heads, -1, -1)
+            v_ctx = k_ctx
+        else:
+            k_main = k[b, :, :lq, :]
+            v_main = v[b, :, :lq, :]
+            k_ctx = k_cache.view(n_heads, total_context_len, head_dim)[
+                :, c_start:c_end, :
+            ]
+            v_ctx = v_cache.view(n_heads, total_context_len, head_dim)[
+                :, c_start:c_end, :
+            ]
+
+        k_all = torch.cat([k_ctx, k_main], dim=1)
+        v_all = torch.cat([v_ctx, v_main], dim=1)
+        out[b, :, :lq, :] = F.scaled_dot_product_attention(
+            q_bh,
+            k_all,
+            v_all,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=scale,
+        )
+    return out
+
+
+def _sdpa_dense_attention_with_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    lengths_q: torch.Tensor,
+    lengths_kv: torch.Tensor,
+    scale: float,
+    is_mla: bool,
+    context_batch_size: int,
+) -> torch.Tensor:
+    bsz, n_heads, _, _ = q.shape
+    if lengths_q.numel() != bsz:
+        raise ValueError("lengths_q must have batch_size elements")
+    if lengths_kv.numel() not in (1, bsz):
+        raise ValueError("lengths_kv must have 1 or batch_size elements")
+
+    out = torch.zeros_like(q)
+    for b in range(bsz):
+        lq = int(lengths_q[b].item())
+        if lq == 0:
+            continue
+        ctx_batch = 0 if context_batch_size == 1 else b
+        lkv = (
+            int(lengths_kv[0].item())
+            if lengths_kv.numel() == 1
+            else int(lengths_kv[ctx_batch].item())
+        )
+
+        q_bh = q[b, :, :lq, :]
+        if is_mla:
+            k_main = k[b, :, :lq, :]
+            v_main = k_main
+            k_ctx = k_cache[ctx_batch, 0, :lkv, :].unsqueeze(0).expand(n_heads, -1, -1)
+            v_ctx = k_ctx
+        else:
+            k_main = k[b, :, :lq, :]
+            v_main = v[b, :, :lq, :]
+            k_ctx = k_cache[ctx_batch, :, :lkv, :]
+            v_ctx = v_cache[ctx_batch, :, :lkv, :]
+
+        k_all = torch.cat([k_ctx, k_main], dim=1)
+        v_all = torch.cat([v_ctx, v_main], dim=1)
+        out[b, :, :lq, :] = F.scaled_dot_product_attention(
+            q_bh,
+            k_all,
+            v_all,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=scale,
+        )
+    return out
+
+
 def _reference_dense_attention_with_cache(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    context_len: int,
+    lengths_q: torch.Tensor,
+    lengths_kv: torch.Tensor,
     scale: float,
     is_mla: bool,
     context_batch_size: int,
 ) -> torch.Tensor:
-    bsz, n_heads, n_ctx, _ = q.shape
+    bsz, n_heads, _, _ = q.shape
+    if lengths_q.numel() != bsz:
+        raise ValueError("lengths_q must have batch_size elements")
+    if lengths_kv.numel() not in (1, bsz):
+        raise ValueError("lengths_kv must have 1 or batch_size elements")
+
     out = torch.zeros_like(q)
     for b in range(bsz):
+        lq = int(lengths_q[b].item())
+        if lq == 0:
+            continue
         ctx_batch = 0 if context_batch_size == 1 else b
+        lkv = (
+            int(lengths_kv[0].item())
+            if lengths_kv.numel() == 1
+            else int(lengths_kv[ctx_batch].item())
+        )
         for h in range(n_heads):
-            q_bh = q[b, h, :n_ctx, :]
+            q_bh = q[b, h, :lq, :]
             if is_mla:
-                k_main = k[b, h, :n_ctx, :]
+                k_main = k[b, h, :lq, :]
                 v_main = k_main
-                k_ctx = k_cache[ctx_batch, 0, :context_len, :]
+                k_ctx = k_cache[ctx_batch, 0, :lkv, :]
                 v_ctx = k_ctx
             else:
-                k_main = k[b, h, :n_ctx, :]
-                v_main = v[b, h, :n_ctx, :]
-                k_ctx = k_cache[ctx_batch, h, :context_len, :]
-                v_ctx = v_cache[ctx_batch, h, :context_len, :]
+                k_main = k[b, h, :lq, :]
+                v_main = v[b, h, :lq, :]
+                k_ctx = k_cache[ctx_batch, h, :lkv, :]
+                v_ctx = v_cache[ctx_batch, h, :lkv, :]
 
             k_all = torch.cat([k_ctx, k_main], dim=0)
             v_all = torch.cat([v_ctx, v_main], dim=0)
             logits = torch.matmul(q_bh, k_all.transpose(0, 1)) * scale
             probs = torch.softmax(logits.float(), dim=-1).to(q.dtype)
-            out[b, h, :n_ctx, :] = torch.matmul(probs, v_all)
+            out[b, h, :lq, :] = torch.matmul(probs, v_all)
     return out
 
 

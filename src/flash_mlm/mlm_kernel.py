@@ -16,6 +16,11 @@ else:
 
 _MLM_BLOCK_M_OPTIONS = [32, 64, 128]
 _MLM_BLOCK_N_OPTIONS = [32, 64, 128]
+_MLM_NUM_WARPS_OPTIONS = [2, 4, 8, 16]
+if is_hip():
+    _MLM_WARP_SPECIALIZE_OPTIONS = [False]
+else:
+    _MLM_WARP_SPECIALIZE_OPTIONS = [False, True]
 
 
 def _set_desc_block_shape_if_needed(nargs, name, block_shape):
@@ -80,48 +85,52 @@ def _mlm_prune_invalid_configs(configs, named_args, **kwargs):
 
 _MLM_COMPRESSED_AUTOTUNE_CONFIGS = [
     triton.Config(
-        {},
+        {"warp_specialize": ws},
         num_stages=s,
         num_warps=w,
         pre_hook=_mlm_compressed_host_descriptor_pre_hook,
     )
     for s in _MLM_NUM_STAGES_OPTIONS
-    for w in [2, 4, 8]
+    for w in _MLM_NUM_WARPS_OPTIONS
+    for ws in _MLM_WARP_SPECIALIZE_OPTIONS
 ]
 
 _MLM_MAIN_AUTOTUNE_CONFIGS = [
     triton.Config(
-        {},
+        {"warp_specialize": ws},
         num_stages=s,
         num_warps=w,
         pre_hook=_mlm_main_host_descriptor_pre_hook,
     )
     for s in _MLM_NUM_STAGES_OPTIONS
-    for w in [2, 4, 8]
+    for w in _MLM_NUM_WARPS_OPTIONS
+    for ws in _MLM_WARP_SPECIALIZE_OPTIONS
 ]
 
 _MLM_MAIN_AUTOTUNE_TILE_CONFIGS = [
     triton.Config(
-        {"BLOCK_M": bm},
+        {"BLOCK_M": bm, "warp_specialize": ws},
         num_stages=s,
         num_warps=w,
         pre_hook=_mlm_main_host_descriptor_pre_hook,
     )
     for bm in _MLM_BLOCK_M_OPTIONS
     for s in _MLM_NUM_STAGES_OPTIONS
-    for w in [2, 4, 8]
+    for w in _MLM_NUM_WARPS_OPTIONS
+    for ws in _MLM_WARP_SPECIALIZE_OPTIONS
 ]
 
 _MLM_COMPRESSED_AUTOTUNE_TILE_CONFIGS = [
     triton.Config(
-        {"BLOCK_M": bm},
+        {"BLOCK_M": bm, "warp_specialize": ws},
         num_stages=s,
         num_warps=w,
         pre_hook=_mlm_compressed_host_descriptor_pre_hook,
     )
     for bm in _MLM_BLOCK_M_OPTIONS
     for s in _MLM_NUM_STAGES_OPTIONS
-    for w in [2, 4, 8]
+    for w in _MLM_NUM_WARPS_OPTIONS
+    for ws in _MLM_WARP_SPECIALIZE_OPTIONS
 ]
 
 
@@ -148,6 +157,7 @@ def _mlm_main_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    warp_specialize: tl.constexpr,
 ):
     _mlm_main_kernel_impl(
         desc_q,
@@ -166,6 +176,7 @@ def _mlm_main_kernel(
         BLOCK_M,
         BLOCK_N,
         HEAD_DIM,
+        warp_specialize,
     )
 
 
@@ -192,6 +203,7 @@ def _mlm_main_kernel_auto_tile(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    warp_specialize: tl.constexpr,
 ):
     _mlm_main_kernel_impl(
         desc_q,
@@ -210,6 +222,7 @@ def _mlm_main_kernel_auto_tile(
         BLOCK_M,
         BLOCK_N,
         HEAD_DIM,
+        warp_specialize,
     )
 
 
@@ -220,8 +233,7 @@ def _mlm_main_kernel_auto_tile(
         "BLOCK_M",
         "BLOCK_N",
         "is_mla",
-        "total_q_len",
-        "total_context_len",
+        "workload_bucket",
     ],
     prune_configs_by={"early_config_prune": _mlm_prune_invalid_configs},
 )
@@ -238,6 +250,7 @@ def _mlm_compressed_kernel(
     total_context_len,  # packed context token count across context batches
     scale,  # softmax scaling factor
     total_q_len,  # packed (and possibly padded) query token count
+    workload_bucket,  # coarse workload bucket used for autotune keying
     batch_ids_q,  # tile_idx -> batch_idx mapping for query tiles
     q_tile_starts_q,  # packed query start offset per tile
     cu_seqlens_q,  # cumulative packed query lengths [B+1]
@@ -247,6 +260,7 @@ def _mlm_compressed_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    warp_specialize: tl.constexpr,
 ):
     _mlm_compressed_kernel_impl(
         desc_q,
@@ -269,6 +283,7 @@ def _mlm_compressed_kernel(
         BLOCK_M,
         BLOCK_N,
         HEAD_DIM,
+        warp_specialize,
     )
 
 
@@ -278,8 +293,7 @@ def _mlm_compressed_kernel(
         "HEAD_DIM",
         "BLOCK_N",
         "is_mla",
-        "total_q_len",
-        "total_context_len",
+        "workload_bucket",
     ],
     prune_configs_by={"early_config_prune": _mlm_prune_invalid_configs},
 )
@@ -296,6 +310,7 @@ def _mlm_compressed_kernel_auto_block_m(
     total_context_len,  # packed context token count across context batches
     scale,  # softmax scaling factor
     total_q_len,  # packed (and possibly padded) query token count
+    workload_bucket,  # coarse workload bucket used for autotune keying
     batch_ids_q,  # tile_idx -> batch_idx mapping for query tiles
     q_tile_starts_q,  # packed query start offset per tile
     cu_seqlens_q,  # cumulative packed query lengths [B+1]
@@ -305,6 +320,7 @@ def _mlm_compressed_kernel_auto_block_m(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    warp_specialize: tl.constexpr,
 ):
     _mlm_compressed_kernel_impl(
         desc_q,
@@ -327,4 +343,5 @@ def _mlm_compressed_kernel_auto_block_m(
         BLOCK_M,
         BLOCK_N,
         HEAD_DIM,
+        warp_specialize,
     )

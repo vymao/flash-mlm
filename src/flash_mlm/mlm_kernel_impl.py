@@ -24,10 +24,13 @@ def _mlm_inner_attention(
     K_END,
     BLOCK_M: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    warp_specialize: tl.constexpr,
     IS_MLA: tl.constexpr,
 ):
     scale_log2 = scale * 1.4426950408889634  # 1 / ln(2)
-    for block_start in tl.range(K_START, K_END, BLOCK_M):
+    for block_start in tl.range(
+        K_START, K_END, BLOCK_M, warp_specialize=warp_specialize
+    ):
         kv_start_offsets = block_start + tl.arange(0, BLOCK_M)
 
         K_block = desc_k.load([offset_y + block_start, 0])
@@ -77,6 +80,7 @@ def _mlm_main_kernel_impl(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    warp_specialize: tl.constexpr,
 ):
     out_ptr = desc_o
     start_block_q = tl.program_id(0)
@@ -167,6 +171,7 @@ def _mlm_main_kernel_impl(
         context_len,
         BLOCK_M,
         HEAD_DIM,
+        warp_specialize,
         is_mla,
     )
 
@@ -186,6 +191,7 @@ def _mlm_main_kernel_impl(
         seq_len,
         BLOCK_M,
         HEAD_DIM,
+        warp_specialize,
         is_mla,
     )
 
@@ -222,6 +228,7 @@ def _mlm_compressed_kernel_impl(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    warp_specialize: tl.constexpr,
 ):
     out_ptr = desc_o
     tile_idx = tl.program_id(0)
@@ -328,6 +335,7 @@ def _mlm_compressed_kernel_impl(
         kv_context_end,
         BLOCK_M,
         HEAD_DIM,
+        warp_specialize,
         is_mla,
     )
 
@@ -348,6 +356,7 @@ def _mlm_compressed_kernel_impl(
         kv_main_k_end,
         BLOCK_M,
         HEAD_DIM,
+        warp_specialize,
         is_mla,
     )
 

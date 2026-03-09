@@ -17,12 +17,14 @@ classifiers = [
 ]
 urls = {Repository = "https://github.com/vymao/flash-mlm", Issues = "https://github.com/vymao/flash-mlm/issues"}
 dependencies = [
-    "triton (>=3.6.0,<4.0.0)",
     "torch (>=2.5.1,<3.0.0)",
     "numpy (>=1.22,<3.0.0)"
 ]
 
 [project.optional-dependencies]
+gpu = [
+    "triton (>=3.6.0,<4.0.0)",
+]
 dev = [
     "pytest (>=9.0.2,<10.0.0)",
 ]

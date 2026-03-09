@@ -1,6 +1,12 @@
 import torch
 
-import triton
+try:
+    import triton
+
+    _TRITON_AVAILABLE = True
+except ImportError:
+    triton = None
+    _TRITON_AVAILABLE = False
 
 from flash_mlm.host_utils import (
     PackMetadata,
@@ -15,15 +21,28 @@ from flash_mlm.host_utils import (
     validate_packed_cache_shapes,
     validate_qkv_same_shape_rank4,
 )
-from flash_mlm.kernel_utils import supports_host_descriptor
-from flash_mlm.mlm_kernel import (
-    _MLM_BLOCK_M_OPTIONS,
-    _mlm_compressed_kernel,
-    _mlm_compressed_kernel_auto_block_m,
-    _mlm_main_kernel,
-    _mlm_main_kernel_auto_tile,
-)
 from flash_mlm.cache import InferenceCache
+
+# Lazy imports for GPU-only kernel modules
+if _TRITON_AVAILABLE:
+    from flash_mlm.kernel_utils import supports_host_descriptor
+    from flash_mlm.mlm_kernel import (
+        _MLM_BLOCK_M_OPTIONS,
+        _mlm_compressed_kernel,
+        _mlm_compressed_kernel_auto_block_m,
+        _mlm_main_kernel,
+        _mlm_main_kernel_auto_tile,
+    )
+else:
+    # Provide stubs
+    def supports_host_descriptor():
+        return False
+
+    _MLM_BLOCK_M_OPTIONS = []
+    _mlm_compressed_kernel = None
+    _mlm_compressed_kernel_auto_block_m = None
+    _mlm_main_kernel = None
+    _mlm_main_kernel_auto_tile = None
 
 
 def flash_attn_mlm(

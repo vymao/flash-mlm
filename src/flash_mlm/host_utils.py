@@ -2,7 +2,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from triton.tools.tensor_descriptor import TensorDescriptor
+
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+except ImportError:
+    TensorDescriptor = None
 
 from flash_mlm.cache import InferenceCache
 

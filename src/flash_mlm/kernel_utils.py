@@ -1,8 +1,12 @@
 import torch
 import os
 
-import triton
-import triton.language as tl
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None
 
 
 def _get_triton_backend() -> str | None:

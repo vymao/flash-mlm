@@ -25,7 +25,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          pytest -q src/flash_mlm/test_host_utils.py
+          pytest -q src/flash_mlm/host/test_host_utils.py
 
   build:
     needs: test

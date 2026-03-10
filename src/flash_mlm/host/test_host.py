@@ -1,6 +1,14 @@
-from flash_mlm.host import flash_attn_mlm, flash_attn_mlm_compressed
-from flash_mlm.host_utils import build_pack_metadata, unpack_from_kernel
-from flash_mlm.cache import InferenceCache
+from flash_mlm.host import (
+    flash_attn_mlm,
+    flash_attn_mlm_compressed,
+    flash_attn_mlm_precompressed,
+)
+from flash_mlm.host.host_utils import (
+    build_pack_metadata,
+    unpack_from_kernel,
+    pack_for_kernel,
+)
+from flash_mlm.host.cache import InferenceCache
 import torch
 import pytest
 import triton
@@ -802,6 +810,261 @@ def test_mlm_compressed_matches_reference_with_cache(is_mla):
 #     if mode == "bwd":
 #         total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
 #     return total_flops * 1e-12 / (ms * 1e-3)
+
+
+@pytest.mark.parametrize("is_mla", [False, True])
+def test_mlm_precompressed_matches_compressed_no_cache(is_mla):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    torch.manual_seed(50)
+    B, H, N, D = 2, 3, 48, 64
+    lengths = torch.tensor([48, 37], device=DEVICE, dtype=torch.int32)
+    scale = 0.7
+    block_m, block_n = 32, 32
+
+    q = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    k = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    v = k if is_mla else torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+
+    total_context_len = 0
+    k_cache = torch.empty(
+        (total_context_len, D) if is_mla else (H * total_context_len, D),
+        device=DEVICE,
+        dtype=torch.float16,
+    )
+    v_cache = torch.empty_like(k_cache)
+    cu_seqlens_kv = torch.zeros(B + 1, device=DEVICE, dtype=torch.int32)
+    cache = InferenceCache()
+    cache.prefill_kv_cache(
+        layer_id=0,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        total_context_len=total_context_len,
+        cu_seqlens_kv=cu_seqlens_kv,
+        context_batch_size=B,
+        is_mla=is_mla,
+        num_heads=H,
+        head_dim=D,
+    )
+
+    q_meta = build_pack_metadata(lengths, N, block_n=block_n)
+
+    # Reference: flash_attn_mlm_compressed with padded inputs
+    ref_out = flash_attn_mlm_compressed(
+        q,
+        k,
+        v,
+        num_heads=H,
+        scale=scale,
+        q_meta=q_meta,
+        inference_cache=cache,
+        layer_id=0,
+        is_mla=is_mla,
+        block_m=block_m,
+        block_n=block_n,
+    )
+
+    # Pre-pack q, k, v manually and call precompressed
+    q_packed = pack_for_kernel(q, q_meta, flatten_for_kernel=True)
+    if is_mla:
+        k_packed = pack_for_kernel(
+            k[:, :1, :, :], q_meta, flatten_for_kernel=False
+        ).squeeze(0)
+        v_packed = k_packed
+    else:
+        k_packed = pack_for_kernel(k, q_meta, flatten_for_kernel=True)
+        v_packed = pack_for_kernel(v, q_meta, flatten_for_kernel=True)
+
+    cache2 = InferenceCache()
+    cache2.prefill_kv_cache(
+        layer_id=0,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        total_context_len=total_context_len,
+        cu_seqlens_kv=cu_seqlens_kv,
+        context_batch_size=B,
+        is_mla=is_mla,
+        num_heads=H,
+        head_dim=D,
+    )
+
+    total_q_len = q_packed.shape[0] // H
+    pre_out = flash_attn_mlm_precompressed(
+        q_packed,
+        k_packed,
+        v_packed,
+        num_heads=H,
+        total_q_len=total_q_len,
+        cu_seqlens_q=q_meta.cu_seqlens,
+        batch_ids_q=q_meta.batch_ids_q,
+        q_tile_starts_q=q_meta.q_tile_starts_q,
+        scale=scale,
+        inference_cache=cache2,
+        layer_id=0,
+        is_mla=is_mla,
+        block_m=block_m,
+        block_n=block_n,
+    )
+
+    torch.testing.assert_close(pre_out, ref_out, atol=1e-5, rtol=0)
+
+
+@pytest.mark.parametrize("is_mla", [False, True])
+def test_mlm_precompressed_prefill_stores_cache_entry(is_mla):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    torch.manual_seed(52)
+    B, H, N, D = 2, 2, 20, 64
+    lengths = torch.tensor([20, 7], device=DEVICE, dtype=torch.int32)
+    block_m, block_n = 32, 32
+
+    q = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    k = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    v = k if is_mla else torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+
+    q_meta = build_pack_metadata(lengths, N, block_n=block_n)
+
+    q_packed = pack_for_kernel(q, q_meta, flatten_for_kernel=True)
+    if is_mla:
+        k_packed = pack_for_kernel(
+            k[:, :1, :, :], q_meta, flatten_for_kernel=False
+        ).squeeze(0)
+        v_packed = k_packed
+    else:
+        k_packed = pack_for_kernel(k, q_meta, flatten_for_kernel=True)
+        v_packed = pack_for_kernel(v, q_meta, flatten_for_kernel=True)
+
+    total_q_len = q_packed.shape[0] // H
+
+    cache = InferenceCache()
+    flash_attn_mlm_precompressed(
+        q_packed,
+        k_packed,
+        v_packed,
+        num_heads=H,
+        total_q_len=total_q_len,
+        cu_seqlens_q=q_meta.cu_seqlens,
+        batch_ids_q=q_meta.batch_ids_q,
+        q_tile_starts_q=q_meta.q_tile_starts_q,
+        scale=0.55,
+        inference_cache=cache,
+        layer_id=7,
+        is_mla=is_mla,
+        block_m=block_m,
+        block_n=block_n,
+        prefill=True,
+    )
+
+    stored = cache.get_kv_cache(
+        7,
+        is_mla=is_mla,
+        num_heads=H,
+        head_dim=D,
+        dtype=q.dtype,
+        device=q.device,
+    )
+    expected_unpadded_total_q_len = int(lengths.sum().item())
+    assert int(stored.cu_seqlens_kv[-1].item()) == expected_unpadded_total_q_len
+    assert stored.total_context_len >= expected_unpadded_total_q_len
+    if is_mla:
+        assert stored.k_cache.shape[0] == stored.total_context_len
+    else:
+        assert stored.k_cache.shape[0] == H * stored.total_context_len
+    assert stored.context_batch_size == B
+
+
+@pytest.mark.parametrize("is_mla", [False, True])
+def test_mlm_precompressed_matches_compressed_with_cache(is_mla):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    torch.manual_seed(51)
+    B, H, N, D = 2, 3, 48, 64
+    lengths = torch.tensor([48, 37], device=DEVICE, dtype=torch.int32)
+    context_lengths = torch.tensor([13, 9], device=DEVICE, dtype=torch.int32)
+    scale = 0.5
+    block_m, block_n = 32, 32
+
+    q = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    k = torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+    v = k if is_mla else torch.randn((B, H, N, D), device=DEVICE, dtype=torch.float16)
+
+    cu_seqlens_kv = torch.zeros(B + 1, device=DEVICE, dtype=torch.int32)
+    cu_seqlens_kv[1:] = context_lengths.cumsum(0)
+    total_context_len = int(cu_seqlens_kv[-1].item())
+
+    if is_mla:
+        k_cache = torch.randn(
+            (total_context_len, D), device=DEVICE, dtype=torch.float16
+        )
+    else:
+        k_cache = torch.randn(
+            (H * total_context_len, D), device=DEVICE, dtype=torch.float16
+        )
+    v_cache = torch.randn_like(k_cache)
+
+    def _make_cache():
+        c = InferenceCache()
+        c.prefill_kv_cache(
+            layer_id=0,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            total_context_len=total_context_len,
+            cu_seqlens_kv=cu_seqlens_kv,
+            context_batch_size=B,
+            is_mla=is_mla,
+            num_heads=H,
+            head_dim=D,
+        )
+        return c
+
+    q_meta = build_pack_metadata(lengths, N, block_n=block_n)
+
+    ref_out = flash_attn_mlm_compressed(
+        q,
+        k,
+        v,
+        num_heads=H,
+        scale=scale,
+        q_meta=q_meta,
+        inference_cache=_make_cache(),
+        layer_id=0,
+        is_mla=is_mla,
+        block_m=block_m,
+        block_n=block_n,
+    )
+
+    q_packed = pack_for_kernel(q, q_meta, flatten_for_kernel=True)
+    if is_mla:
+        k_packed = pack_for_kernel(
+            k[:, :1, :, :], q_meta, flatten_for_kernel=False
+        ).squeeze(0)
+        v_packed = k_packed
+    else:
+        k_packed = pack_for_kernel(k, q_meta, flatten_for_kernel=True)
+        v_packed = pack_for_kernel(v, q_meta, flatten_for_kernel=True)
+
+    total_q_len = q_packed.shape[0] // H
+    pre_out = flash_attn_mlm_precompressed(
+        q_packed,
+        k_packed,
+        v_packed,
+        num_heads=H,
+        total_q_len=total_q_len,
+        cu_seqlens_q=q_meta.cu_seqlens,
+        batch_ids_q=q_meta.batch_ids_q,
+        q_tile_starts_q=q_meta.q_tile_starts_q,
+        scale=scale,
+        inference_cache=_make_cache(),
+        layer_id=0,
+        is_mla=is_mla,
+        block_m=block_m,
+        block_n=block_n,
+    )
+
+    torch.testing.assert_close(pre_out, ref_out, atol=1e-5, rtol=0)
 
 
 if __name__ == "__main__":

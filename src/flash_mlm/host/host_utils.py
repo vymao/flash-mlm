@@ -8,10 +8,10 @@ try:
 except ImportError:
     TensorDescriptor = None
 
-from flash_mlm.cache import InferenceCache
+from flash_mlm.host.cache import InferenceCache
 
 if TYPE_CHECKING:
-    from flash_mlm.cache import LayerKVEntry, PackingCache
+    from flash_mlm.host.cache import LayerKVEntry, PackingCache
 
 
 @dataclass

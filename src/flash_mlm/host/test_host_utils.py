@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from flash_mlm.host_utils import (
+from flash_mlm.host.host_utils import (
     build_batch_ids_from_cu_seqlens,
     build_pack_metadata,
     build_q_tile_starts_from_cu_seqlens,
@@ -12,7 +12,7 @@ from flash_mlm.host_utils import (
     pack_for_kernel,
     unpack_from_kernel,
 )
-from flash_mlm.cache import PackingCache
+from flash_mlm.host.cache import PackingCache
 
 
 def test_build_pack_metadata_precomputes_indices_and_batch_ids():

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from flash_mlm.host_utils import PackMetadata
+    from flash_mlm.host.host_utils import PackMetadata
 
 
 class PackingCache:
@@ -52,7 +52,7 @@ class PackingCache:
         if meta is not None:
             return meta
 
-        from flash_mlm.host_utils import build_pack_metadata
+        from flash_mlm.host.host_utils import build_pack_metadata
 
         meta = build_pack_metadata(lengths, N, block_n)
         self._pack_meta[key] = meta

@@ -19,6 +19,10 @@ if torch.cuda.is_available():
             flash_attn_mlm_precompressed,
         )
 
+        def _triton_alloc_fn(size: int, alignment: int, stream):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        triton.set_allocator(_triton_alloc_fn)
         _TRITON_AVAILABLE = True
     except ImportError:
         warnings.warn(

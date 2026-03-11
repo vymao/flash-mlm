@@ -25,7 +25,11 @@ def is_cuda():
 
 
 def supports_host_descriptor():
-    return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
+    if not is_cuda() or torch.cuda.get_device_capability()[0] < 9:
+        return False
+    from packaging.version import Version
+
+    return Version(triton.__version__) >= Version("3.6.0")
 
 
 def is_blackwell():

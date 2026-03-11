@@ -143,8 +143,12 @@ def flash_attn_mlm(
         desc_k = make_host_desc(k, y_dim, d)
         desc_v = make_host_desc(v, y_dim, d)
         desc_o = make_host_desc(out, y_dim, d)
-        desc_k_cache = make_host_desc(k_cache, y_dim_context, d)
-        desc_v_cache = make_host_desc(v_cache, y_dim_context, d)
+        if y_dim_context > 0:
+            desc_k_cache = make_host_desc(k_cache, y_dim_context, d)
+            desc_v_cache = make_host_desc(v_cache, y_dim_context, d)
+        else:
+            desc_k_cache = k_cache
+            desc_v_cache = v_cache
     else:
         desc_q = q
         desc_k = k
@@ -441,8 +445,12 @@ def flash_attn_mlm_compressed(
         desc_k = make_host_desc(k, y_dim_kv_main, d)
         desc_v = make_host_desc(v, y_dim_kv_main, d)
         desc_o = make_host_desc(out, y_dim_q, d)
-        desc_k_cache = make_host_desc(k_cache, y_dim_context, d)
-        desc_v_cache = make_host_desc(v_cache, y_dim_context, d)
+        if y_dim_context > 0:
+            desc_k_cache = make_host_desc(k_cache, y_dim_context, d)
+            desc_v_cache = make_host_desc(v_cache, y_dim_context, d)
+        else:
+            desc_k_cache = k_cache
+            desc_v_cache = v_cache
     else:
         desc_q = q
         desc_k = k
@@ -679,8 +687,12 @@ def flash_attn_mlm_precompressed(
         desc_k = make_host_desc(k, y_dim_kv_main, d)
         desc_v = make_host_desc(v, y_dim_kv_main, d)
         desc_o = make_host_desc(out, y_dim_q, d)
-        desc_k_cache = make_host_desc(k_cache, y_dim_context, d)
-        desc_v_cache = make_host_desc(v_cache, y_dim_context, d)
+        if y_dim_context > 0:
+            desc_k_cache = make_host_desc(k_cache, y_dim_context, d)
+            desc_v_cache = make_host_desc(v_cache, y_dim_context, d)
+        else:
+            desc_k_cache = k_cache
+            desc_v_cache = v_cache
     else:
         desc_q = q
         desc_k = k

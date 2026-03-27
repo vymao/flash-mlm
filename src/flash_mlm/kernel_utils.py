@@ -1,12 +1,7 @@
 import torch
 import os
-
-try:
-    import triton
-    import triton.language as tl
-except ImportError:
-    triton = None
-    tl = None
+import triton
+import triton.language as tl
 
 
 def _get_triton_backend() -> str | None:
@@ -25,11 +20,7 @@ def is_cuda():
 
 
 def supports_host_descriptor():
-    if not is_cuda() or torch.cuda.get_device_capability()[0] < 9:
-        return False
-    from packaging.version import Version
-
-    return Version(triton.__version__) >= Version("3.6.0")
+    return is_cuda() and torch.cuda.get_device_capability()[0] >= 9
 
 
 def is_blackwell():

@@ -32,7 +32,7 @@ class PackMetadata:
 @dataclass
 class CacheContext:
     k_cache: torch.Tensor
-    v_cache: torch.Tensor
+    v_cache: torch.Tensor | None
     context_batch_size: int
     context_len: int
     total_context_len: int
@@ -321,7 +321,7 @@ def _compute_total_q_len_padded(
 def require_cuda_tensors(
     *tensors: torch.Tensor, message: str = "All tensors must be CUDA tensors"
 ):
-    if not all(t.is_cuda for t in tensors):
+    if not all(t is None or t.is_cuda for t in tensors):
         raise ValueError(message)
 
 
@@ -355,31 +355,49 @@ def validate_cu_seqlens_rank1_min2(*cu_seqlens: torch.Tensor):
 
 def validate_packed_cache_shapes(
     k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
+    v_cache: torch.Tensor | None,
     *,
     num_heads: int,
     total_context_len: int,
     head_dim: int,
     is_mla: bool,
 ):
-    if k_cache.ndim != 2 or v_cache.ndim != 2:
-        raise ValueError("k_cache/v_cache must be rank-2 packed tensors")
-    if v_cache.shape != k_cache.shape:
-        raise ValueError("v_cache shape must match k_cache shape")
+    if k_cache.ndim != 2:
+        raise ValueError("k_cache must be a rank-2 packed tensor")
     if k_cache.shape[1] != head_dim:
-        raise ValueError("k_cache/v_cache second dim must match q/k/v head_dim")
+        raise ValueError("k_cache second dim must match q/k/v head_dim")
+    if is_mla:
+        if v_cache is not None:
+            if v_cache.ndim != 2:
+                raise ValueError("MLA v_cache must be a rank-2 packed tensor")
+            if v_cache.shape != k_cache.shape:
+                raise ValueError("MLA v_cache shape must match k_cache shape")
+    else:
+        if v_cache is None:
+            raise ValueError("non-MLA cache requires v_cache")
+        if v_cache.ndim != 2:
+            raise ValueError("v_cache must be a rank-2 packed tensor")
+        if v_cache.shape != k_cache.shape:
+            raise ValueError("v_cache shape must match k_cache shape")
+        if v_cache.shape[1] != head_dim:
+            raise ValueError("v_cache second dim must match q/k/v head_dim")
     expected_context_rows = (
         total_context_len if is_mla else num_heads * total_context_len
     )
     if k_cache.shape[0] != expected_context_rows:
         raise ValueError(
-            "k_cache/v_cache first dim mismatch: expected "
+            "k_cache first dim mismatch: expected "
+            f"{expected_context_rows} rows for is_mla={is_mla}"
+        )
+    if not is_mla and v_cache.shape[0] != expected_context_rows:
+        raise ValueError(
+            "v_cache first dim mismatch: expected "
             f"{expected_context_rows} rows for is_mla={is_mla}"
         )
 
 
-def make_contiguous(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    return tuple(t.contiguous() for t in tensors)
+def make_contiguous(*tensors: torch.Tensor | None) -> tuple[torch.Tensor | None, ...]:
+    return tuple(t if t is None else t.contiguous() for t in tensors)
 
 
 def _pack_flatten_for_kernel_into(

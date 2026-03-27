@@ -66,7 +66,7 @@ class PackingCache:
 @dataclass
 class LayerKVEntry:
     k_cache: torch.Tensor
-    v_cache: torch.Tensor
+    v_cache: torch.Tensor | None
     total_context_len: int
     cu_seqlens_kv: torch.Tensor | None
     context_batch_size: int
@@ -92,22 +92,46 @@ class InferenceCache:
     def _validate_kv_common_inputs(
         *,
         k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
+        v_cache: torch.Tensor | None,
         total_context_len: int,
         is_mla: bool,
         num_heads: int,
         head_dim: int,
     ) -> None:
-        if k_cache.ndim != 2 or v_cache.ndim != 2:
-            raise ValueError("k_cache/v_cache must be rank-2 packed tensors")
-        if v_cache.shape != k_cache.shape:
-            raise ValueError("v_cache shape must match k_cache shape")
+        if k_cache.ndim != 2:
+            raise ValueError("k_cache must be a rank-2 packed tensor")
         if k_cache.shape[1] != head_dim:
-            raise ValueError("k_cache/v_cache second dim must match head_dim")
+            raise ValueError("k_cache second dim must match head_dim")
+        if not k_cache.is_contiguous():
+            raise ValueError("k_cache must be contiguous")
+        if is_mla:
+            if v_cache is not None:
+                if v_cache.ndim != 2:
+                    raise ValueError("MLA v_cache must be a rank-2 packed tensor")
+                if v_cache.shape != k_cache.shape:
+                    raise ValueError("MLA v_cache shape must match k_cache shape")
+                if not v_cache.is_contiguous():
+                    raise ValueError("MLA v_cache must be contiguous")
+        else:
+            if v_cache is None:
+                raise ValueError("non-MLA cache requires v_cache")
+            if v_cache.ndim != 2:
+                raise ValueError("v_cache must be a rank-2 packed tensor")
+            if v_cache.shape != k_cache.shape:
+                raise ValueError("v_cache shape must match k_cache shape")
+            if v_cache.shape[1] != head_dim:
+                raise ValueError("v_cache second dim must match head_dim")
+            if not v_cache.is_contiguous():
+                raise ValueError("v_cache must be contiguous")
         expected_rows = total_context_len if is_mla else num_heads * total_context_len
         if k_cache.shape[0] != expected_rows:
             raise ValueError(
-                "k_cache/v_cache first dim mismatch: expected "
+                "k_cache first dim mismatch: expected "
+                f"{expected_rows} rows for is_mla={is_mla}"
+            )
+        if not is_mla and v_cache.shape[0] != expected_rows:
+            raise ValueError(
+                "v_cache first dim mismatch: expected "
                 f"{expected_rows} rows for is_mla={is_mla}"
             )
 
@@ -115,7 +139,7 @@ class InferenceCache:
     def _validate_kv_entry_inputs(
         *,
         k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
+        v_cache: torch.Tensor | None,
         total_context_len: int,
         cu_seqlens_kv: torch.Tensor,
         context_batch_size: int,
@@ -145,7 +169,7 @@ class InferenceCache:
         layer_id: int | str,
         *,
         k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
+        v_cache: torch.Tensor | None = None,
         total_context_len: int | None = None,
         cu_seqlens_kv: torch.Tensor | None = None,
         context_batch_size: int,
@@ -199,7 +223,7 @@ class InferenceCache:
         layer_key = self._layer_key(layer_id)
         self._layer_kv[layer_key] = LayerKVEntry(
             k_cache=k_cache,
-            v_cache=v_cache,
+            v_cache=(None if is_mla else v_cache),
             total_context_len=int(total_context_len),
             cu_seqlens_kv=(
                 cu_seqlens_kv.contiguous() if cu_seqlens_kv is not None else None

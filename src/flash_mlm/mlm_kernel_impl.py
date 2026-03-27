@@ -77,6 +77,8 @@ def _mlm_main_kernel_impl(
     scale,
     seq_len,
     is_mla: tl.constexpr,
+    prefill: tl.constexpr,
+    force_desc_input: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -89,47 +91,34 @@ def _mlm_main_kernel_impl(
     head_idx = off_hz % num_heads
 
     y_dim = batch_size * num_heads * seq_len
-    desc_q = _maybe_make_tensor_desc(
-        desc_q,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N, HEAD_DIM],
-    )
-    desc_k = _maybe_make_tensor_desc(
-        desc_k,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M, HEAD_DIM],
-    )
-    desc_v = _maybe_make_tensor_desc(
-        desc_v,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M, HEAD_DIM],
-    )
-    desc_o = _maybe_make_tensor_desc(
-        desc_o,
-        shape=[y_dim, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N, HEAD_DIM],
-    )
-
-    if is_mla:
-        y_dim_context = context_batch_size * context_len
-    else:
-        y_dim_context = context_batch_size * num_heads * context_len
-    desc_k_cache = _maybe_make_tensor_desc(
-        desc_k_cache,
-        shape=[y_dim_context, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M, HEAD_DIM],
-    )
-    desc_v_cache = _maybe_make_tensor_desc(
-        desc_v_cache,
-        shape=[y_dim_context, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M, HEAD_DIM],
-    )
+    if not force_desc_input:
+        desc_q = _maybe_make_tensor_desc(
+            desc_q,
+            shape=[y_dim, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=[BLOCK_N, HEAD_DIM],
+        )
+        desc_k = _maybe_make_tensor_desc(
+            desc_k,
+            shape=[y_dim, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=[BLOCK_M, HEAD_DIM],
+        )
+        if is_mla:
+            desc_v = desc_k
+        else:
+            desc_v = _maybe_make_tensor_desc(
+                desc_v,
+                shape=[y_dim, HEAD_DIM],
+                strides=[HEAD_DIM, 1],
+                block_shape=[BLOCK_M, HEAD_DIM],
+            )
+        desc_o = _maybe_make_tensor_desc(
+            desc_o,
+            shape=[y_dim, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=[BLOCK_N, HEAD_DIM],
+        )
 
     start_block_q = start_block_q * BLOCK_N
     offset_y = batch_idx * (seq_len * num_heads) + head_idx * seq_len
@@ -155,25 +144,46 @@ def _mlm_main_kernel_impl(
     l_i = tl.zeros([BLOCK_N], dtype=tl.float32)
     o_i = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
 
-    o_i, l_i, m_i = _mlm_inner_attention(
-        Q_block,
-        q_start_offsets,
-        offset_y_context,
-        desc_k_cache,
-        desc_v_cache,
-        l_i,
-        m_i,
-        o_i,
-        scale,
-        0,
-        seq_len,
-        0,
-        context_len,
-        BLOCK_M,
-        HEAD_DIM,
-        warp_specialize,
-        is_mla,
-    )
+    if not prefill:
+        if is_mla:
+            y_dim_context = context_batch_size * context_len
+        else:
+            y_dim_context = context_batch_size * num_heads * context_len
+        if not force_desc_input:
+            desc_k_cache = _maybe_make_tensor_desc(
+                desc_k_cache,
+                shape=[y_dim_context, HEAD_DIM],
+                strides=[HEAD_DIM, 1],
+                block_shape=[BLOCK_M, HEAD_DIM],
+            )
+            if is_mla:
+                desc_v_cache = desc_k_cache
+            else:
+                desc_v_cache = _maybe_make_tensor_desc(
+                    desc_v_cache,
+                    shape=[y_dim_context, HEAD_DIM],
+                    strides=[HEAD_DIM, 1],
+                    block_shape=[BLOCK_M, HEAD_DIM],
+                )
+        o_i, l_i, m_i = _mlm_inner_attention(
+            Q_block,
+            q_start_offsets,
+            offset_y_context,
+            desc_k_cache,
+            desc_v_cache,
+            l_i,
+            m_i,
+            o_i,
+            scale,
+            0,
+            seq_len,
+            0,
+            context_len,
+            BLOCK_M,
+            HEAD_DIM,
+            warp_specialize,
+            is_mla,
+        )
 
     o_i, l_i, m_i = _mlm_inner_attention(
         Q_block,
@@ -224,7 +234,9 @@ def _mlm_compressed_kernel_impl(
     cu_seqlens_q,
     cu_seqlens_kv,
     is_mla: tl.constexpr,
+    prefill: tl.constexpr,
     causal_query_seq_attn: tl.constexpr,
+    force_desc_input: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -242,48 +254,34 @@ def _mlm_compressed_kernel_impl(
         y_dim_kv_main = total_q_len
     else:
         y_dim_kv_main = num_heads * total_q_len
-    desc_q = _maybe_make_tensor_desc(
-        desc_q,
-        shape=[y_dim_qo, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_N, HEAD_DIM],
-    )
-    desc_k = _maybe_make_tensor_desc(
-        desc_k,
-        shape=[y_dim_kv_main, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M, HEAD_DIM],
-    )
-    desc_v = _maybe_make_tensor_desc(
-        desc_v,
-        shape=[y_dim_kv_main, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M, HEAD_DIM],
-    )
-
-    if is_mla:
-        y_dim_context = total_context_len
-    else:
-        y_dim_context = num_heads * total_context_len
-    desc_k_cache = _maybe_make_tensor_desc(
-        desc_k_cache,
-        shape=[y_dim_context, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M, HEAD_DIM],
-    )
-    desc_v_cache = _maybe_make_tensor_desc(
-        desc_v_cache,
-        shape=[y_dim_context, HEAD_DIM],
-        strides=[HEAD_DIM, 1],
-        block_shape=[BLOCK_M, HEAD_DIM],
-    )
+    if not force_desc_input:
+        desc_q = _maybe_make_tensor_desc(
+            desc_q,
+            shape=[y_dim_qo, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=[BLOCK_N, HEAD_DIM],
+        )
+        desc_k = _maybe_make_tensor_desc(
+            desc_k,
+            shape=[y_dim_kv_main, HEAD_DIM],
+            strides=[HEAD_DIM, 1],
+            block_shape=[BLOCK_M, HEAD_DIM],
+        )
+        if is_mla:
+            desc_v = desc_k
+        else:
+            desc_v = _maybe_make_tensor_desc(
+                desc_v,
+                shape=[y_dim_kv_main, HEAD_DIM],
+                strides=[HEAD_DIM, 1],
+                block_shape=[BLOCK_M, HEAD_DIM],
+            )
 
     q_head_offset = head_idx * total_q_len
     q_tile_block_offset = start_block_q + q_head_offset
 
     q_start = tl.load(cu_seqlens_q + batch_idx)
     q_end = tl.load(cu_seqlens_q + batch_idx + 1)
-    q_len = q_end - q_start
     q_start_offsets = start_block_q + tl.arange(0, BLOCK_N)
     q_valid_start = q_start
     q_valid_end = q_end
@@ -318,26 +316,46 @@ def _mlm_compressed_kernel_impl(
     l_i = tl.zeros([BLOCK_N], dtype=tl.float32)
     o_i = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
 
-    # Context
-    o_i, l_i, m_i = _mlm_inner_attention(
-        Q_block,
-        q_start_offsets,
-        kv_context_start_offset,
-        desc_k_cache,
-        desc_v_cache,
-        l_i,
-        m_i,
-        o_i,
-        scale,
-        q_valid_start,
-        q_valid_end,
-        kv_context_start,
-        kv_context_end,
-        BLOCK_M,
-        HEAD_DIM,
-        warp_specialize,
-        is_mla,
-    )
+    if not prefill:
+        if is_mla:
+            y_dim_context = total_context_len
+        else:
+            y_dim_context = num_heads * total_context_len
+        if not force_desc_input:
+            desc_k_cache = _maybe_make_tensor_desc(
+                desc_k_cache,
+                shape=[y_dim_context, HEAD_DIM],
+                strides=[HEAD_DIM, 1],
+                block_shape=[BLOCK_M, HEAD_DIM],
+            )
+            if is_mla:
+                desc_v_cache = desc_k_cache
+            else:
+                desc_v_cache = _maybe_make_tensor_desc(
+                    desc_v_cache,
+                    shape=[y_dim_context, HEAD_DIM],
+                    strides=[HEAD_DIM, 1],
+                    block_shape=[BLOCK_M, HEAD_DIM],
+                )
+        o_i, l_i, m_i = _mlm_inner_attention(
+            Q_block,
+            q_start_offsets,
+            kv_context_start_offset,
+            desc_k_cache,
+            desc_v_cache,
+            l_i,
+            m_i,
+            o_i,
+            scale,
+            q_valid_start,
+            q_valid_end,
+            kv_context_start,
+            kv_context_end,
+            BLOCK_M,
+            HEAD_DIM,
+            warp_specialize,
+            is_mla,
+        )
 
     # Main
     o_i, l_i, m_i = _mlm_inner_attention(

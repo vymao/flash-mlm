@@ -145,7 +145,10 @@ def flash_attn_mlm(
         desc_o = make_host_desc(out, y_dim, d)
         if y_dim_context > 0:
             desc_k_cache = make_host_desc(k_cache, y_dim_context, d)
-            desc_v_cache = make_host_desc(v_cache, y_dim_context, d)
+            if is_mla:
+                desc_v_cache = desc_k_cache
+            else:
+                desc_v_cache = make_host_desc(v_cache, y_dim_context, d)
         else:
             desc_k_cache = k_cache
             desc_v_cache = v_cache
@@ -174,6 +177,8 @@ def flash_attn_mlm(
             scale,
             n,
             is_mla=is_mla,
+            prefill=prefill,
+            force_desc_input=supports_host_descriptor(),
             BLOCK_N=block_n,
             HEAD_DIM=d,
         )
@@ -192,6 +197,8 @@ def flash_attn_mlm(
             scale,
             n,
             is_mla=is_mla,
+            prefill=prefill,
+            force_desc_input=supports_host_descriptor(),
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             HEAD_DIM=d,
@@ -348,7 +355,7 @@ def flash_attn_mlm_compressed(
         inference_cache.prefill_kv_cache(
             layer_id,
             k_cache=k,
-            v_cache=v,
+            v_cache=(None if is_mla else v),
             total_context_len=int(total_q_len),
             cu_seqlens_kv=cu_seqlens_q,
             context_batch_size=int(b),
@@ -447,7 +454,10 @@ def flash_attn_mlm_compressed(
         desc_o = make_host_desc(out, y_dim_q, d)
         if y_dim_context > 0:
             desc_k_cache = make_host_desc(k_cache, y_dim_context, d)
-            desc_v_cache = make_host_desc(v_cache, y_dim_context, d)
+            if is_mla:
+                desc_v_cache = desc_k_cache
+            else:
+                desc_v_cache = make_host_desc(v_cache, y_dim_context, d)
         else:
             desc_k_cache = k_cache
             desc_v_cache = v_cache
@@ -478,7 +488,9 @@ def flash_attn_mlm_compressed(
             cu_seqlens_q,
             cu_seqlens_kv,
             is_mla=is_mla,
+            prefill=prefill,
             causal_query_seq_attn=causal_query_seq_attn,
+            force_desc_input=supports_host_descriptor(),
             BLOCK_N=block_n,
             HEAD_DIM=d,
         )
@@ -501,7 +513,9 @@ def flash_attn_mlm_compressed(
             cu_seqlens_q,
             cu_seqlens_kv,
             is_mla=is_mla,
+            prefill=prefill,
             causal_query_seq_attn=causal_query_seq_attn,
+            force_desc_input=supports_host_descriptor(),
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             HEAD_DIM=d,
@@ -689,7 +703,10 @@ def flash_attn_mlm_precompressed(
         desc_o = make_host_desc(out, y_dim_q, d)
         if y_dim_context > 0:
             desc_k_cache = make_host_desc(k_cache, y_dim_context, d)
-            desc_v_cache = make_host_desc(v_cache, y_dim_context, d)
+            if is_mla:
+                desc_v_cache = desc_k_cache
+            else:
+                desc_v_cache = make_host_desc(v_cache, y_dim_context, d)
         else:
             desc_k_cache = k_cache
             desc_v_cache = v_cache
@@ -720,7 +737,9 @@ def flash_attn_mlm_precompressed(
             cu_seqlens_q,
             cu_seqlens_kv,
             is_mla=is_mla,
+            prefill=prefill,
             causal_query_seq_attn=causal_query_seq_attn,
+            force_desc_input=supports_host_descriptor(),
             BLOCK_N=block_n,
             HEAD_DIM=d,
         )
@@ -743,7 +762,9 @@ def flash_attn_mlm_precompressed(
             cu_seqlens_q,
             cu_seqlens_kv,
             is_mla=is_mla,
+            prefill=prefill,
             causal_query_seq_attn=causal_query_seq_attn,
+            force_desc_input=supports_host_descriptor(),
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             HEAD_DIM=d,
@@ -755,7 +776,7 @@ def flash_attn_mlm_precompressed(
         inference_cache.prefill_kv_cache(
             layer_id,
             k_cache=k,
-            v_cache=v,
+            v_cache=(None if is_mla else v),
             total_context_len=int(total_q_len),
             cu_seqlens_kv=cu_seqlens_q,
             context_batch_size=b,

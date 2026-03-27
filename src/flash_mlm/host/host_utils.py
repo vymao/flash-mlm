@@ -203,14 +203,15 @@ def _maybe_get_cache_context(
         k_cache = entry.k_cache
         v_cache = entry.v_cache
 
-        resolved_context_batch_size = entry.context_batch_size
-        if (
-            context_batch_size is not None
-            and context_batch_size != resolved_context_batch_size
-        ):
-            raise ValueError(
-                "context_batch_size must match cached entry context_batch_size"
-            )
+        stored_context_batch_size = entry.context_batch_size
+        resolved_context_batch_size = stored_context_batch_size
+        if context_batch_size is not None:
+            if context_batch_size == 1:
+                resolved_context_batch_size = 1
+            elif context_batch_size != stored_context_batch_size:
+                raise ValueError(
+                    f"context_batch_size ({context_batch_size}) must match cached entry context_batch_size ({stored_context_batch_size})"
+                )
         if resolved_context_batch_size < 1:
             raise ValueError("context_batch_size must be >= 1")
 
@@ -218,16 +219,22 @@ def _maybe_get_cache_context(
         if compressed:
             cu_seqlens_kv = entry.cu_seqlens_kv
             if cu_seqlens_kv is None:
-                if total_context_len % resolved_context_batch_size != 0:
+                if total_context_len % stored_context_batch_size != 0:
                     raise ValueError(
                         "compressed path requires cu_seqlens_kv or uniform per-batch context lengths"
                     )
-                context_len = total_context_len // resolved_context_batch_size
+                context_len = total_context_len // stored_context_batch_size
                 cu_seqlens_kv = torch.arange(
-                    resolved_context_batch_size + 1,
+                    stored_context_batch_size + 1,
                     device=device,
                     dtype=torch.int32,
                 ) * int(context_len)
+            if resolved_context_batch_size == 1 and stored_context_batch_size != 1:
+                cu_seqlens_kv = torch.tensor(
+                    [0, total_context_len],
+                    device=device,
+                    dtype=torch.int32,
+                )
         else:
             cu_seqlens_kv = None
             if total_context_len % resolved_context_batch_size != 0:

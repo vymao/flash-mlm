@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from flash_mlm.host.host_utils import (
+    _maybe_get_cache_context,
     build_batch_ids_from_cu_seqlens,
     build_pack_metadata,
     build_q_tile_starts_from_cu_seqlens,
@@ -12,7 +13,7 @@ from flash_mlm.host.host_utils import (
     pack_for_kernel,
     unpack_from_kernel,
 )
-from flash_mlm.host.cache import PackingCache
+from flash_mlm.host.cache import InferenceCache, PackingCache
 
 
 def test_build_pack_metadata_precomputes_indices_and_batch_ids():
@@ -308,3 +309,112 @@ def test_pack_and_pad_main_tensors_for_mlm_compressed_uses_packing_cache_mla():
         .untyped_storage()
         .data_ptr()
     )
+
+
+def test_maybe_get_cache_context_preserves_multi_batch_compressed_cache_layout():
+    cache = InferenceCache()
+    cu_seqlens_kv = torch.tensor([0, 2, 5, 7], dtype=torch.int32)
+    k_cache = torch.arange(7 * 4, dtype=torch.float32).view(7, 4)
+    cache.prefill_kv_cache(
+        0,
+        k_cache=k_cache,
+        v_cache=None,
+        total_context_len=7,
+        cu_seqlens_kv=cu_seqlens_kv,
+        context_batch_size=3,
+        is_mla=True,
+        num_heads=2,
+        head_dim=4,
+    )
+
+    ctx = _maybe_get_cache_context(
+        inference_cache=cache,
+        layer_id=0,
+        batch_size=5,
+        num_heads=2,
+        head_dim=4,
+        is_mla=True,
+        context_batch_size=3,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        compressed=True,
+    )
+
+    assert ctx.context_batch_size == 3
+    assert ctx.total_context_len == 7
+    assert ctx.k_cache is k_cache
+    torch.testing.assert_close(ctx.cu_seqlens_kv, cu_seqlens_kv)
+
+
+def test_maybe_get_cache_context_supports_shared_compressed_cache_layout():
+    cache = InferenceCache()
+    cu_seqlens_kv = torch.tensor([0, 2, 5, 7], dtype=torch.int32)
+    k_cache = torch.arange(7 * 4, dtype=torch.float32).view(7, 4)
+    cache.prefill_kv_cache(
+        0,
+        k_cache=k_cache,
+        v_cache=None,
+        total_context_len=7,
+        cu_seqlens_kv=cu_seqlens_kv,
+        context_batch_size=3,
+        is_mla=True,
+        num_heads=2,
+        head_dim=4,
+    )
+
+    ctx = _maybe_get_cache_context(
+        inference_cache=cache,
+        layer_id=0,
+        batch_size=5,
+        num_heads=2,
+        head_dim=4,
+        is_mla=True,
+        context_batch_size=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        compressed=True,
+    )
+
+    assert ctx.context_batch_size == 1
+    assert ctx.total_context_len == 7
+    assert ctx.k_cache is k_cache
+    torch.testing.assert_close(
+        ctx.cu_seqlens_kv,
+        torch.tensor([0, 7], dtype=torch.int32),
+    )
+
+
+def test_maybe_get_cache_context_supports_shared_dense_cache_layout():
+    cache = InferenceCache()
+    k_cache = torch.arange(12 * 4, dtype=torch.float32).view(12, 4)
+    v_cache = k_cache + 1000
+    cache.prefill_kv_cache(
+        0,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        total_context_len=6,
+        context_batch_size=3,
+        is_mla=False,
+        num_heads=2,
+        head_dim=4,
+    )
+
+    ctx = _maybe_get_cache_context(
+        inference_cache=cache,
+        layer_id=0,
+        batch_size=5,
+        num_heads=2,
+        head_dim=4,
+        is_mla=False,
+        context_batch_size=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        compressed=False,
+    )
+
+    assert ctx.context_batch_size == 1
+    assert ctx.total_context_len == 6
+    assert ctx.context_len == 6
+    assert ctx.k_cache is k_cache
+    assert ctx.v_cache is v_cache
+    assert ctx.cu_seqlens_kv is None

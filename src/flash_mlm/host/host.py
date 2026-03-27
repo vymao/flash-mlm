@@ -692,7 +692,7 @@ def flash_attn_mlm_precompressed(
     else:
         workload_bucket = 2
 
-    if supports_host_descriptor():
+    if supports_host_descriptor() and False:
         y_dim_q = num_heads * total_q_len
         y_dim_kv_main = total_q_len if is_mla else num_heads * total_q_len
         y_dim_context = total_context_len if is_mla else num_heads * total_context_len
@@ -738,7 +738,8 @@ def flash_attn_mlm_precompressed(
             is_mla=is_mla,
             prefill=prefill,
             causal_query_seq_attn=causal_query_seq_attn,
-            force_desc_input=supports_host_descriptor(),
+            # force_desc_input=supports_host_descriptor(),
+            force_desc_input=False,
             BLOCK_N=block_n,
             HEAD_DIM=d,
         )
@@ -763,7 +764,8 @@ def flash_attn_mlm_precompressed(
             is_mla=is_mla,
             prefill=prefill,
             causal_query_seq_attn=causal_query_seq_attn,
-            force_desc_input=supports_host_descriptor(),
+            # force_desc_input=supports_host_descriptor()
+            force_desc_input=False,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             HEAD_DIM=d,

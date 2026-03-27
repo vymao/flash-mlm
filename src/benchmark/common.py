@@ -4,8 +4,8 @@ import torch
 import triton
 
 from flash_mlm.host import flash_attn_mlm_compressed
-from flash_mlm.cache import InferenceCache
-from flash_mlm.host_utils import build_pack_metadata
+from flash_mlm.host.cache import InferenceCache
+from flash_mlm.host.host_utils import build_pack_metadata
 from flash_mlm.kernel_utils import is_hip
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -107,7 +107,7 @@ def run_mlm_compressed_case(
 
     if is_mla:
         k_cache = torch.randn((total_context_len, head_dim), device=device, dtype=dtype)
-        v_cache = torch.randn_like(k_cache)
+        v_cache = None
     else:
         k_cache = torch.randn(
             (num_heads * total_context_len, head_dim), device=device, dtype=dtype

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+poetry run pytest src/flash_mlm/host/test_host_utils.py src/flash_mlm/host/test_host.py
+
 if [ $# -ge 1 ]; then
     poetry version "$1"
 else
@@ -8,8 +10,6 @@ else
 fi
 
 VERSION=$(poetry version -s)
-
-poetry run pytest src/flash_mlm/host/test_host_utils.py src/flash_mlm/host/test_host.py
 
 git add -A
 git commit -m "v${VERSION}: release"

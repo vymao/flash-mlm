@@ -239,7 +239,9 @@ def _maybe_get_cache_context(
             expected_rows = (
                 total_context_len if is_mla else num_heads * total_context_len
             )
-            if k_cache.shape[0] != expected_rows or v_cache.shape[0] != expected_rows:
+            if k_cache.shape[0] != expected_rows or (
+                not is_mla and v_cache.shape[0] != expected_rows
+            ):
                 raise ValueError(
                     "cached dense k/v rows mismatch expected layout for is_mla/num_heads"
                 )

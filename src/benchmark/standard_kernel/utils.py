@@ -2,8 +2,15 @@ import math
 
 import torch
 import torch.nn.functional as F
+import triton
 
-from flash_mlm.host_utils import build_pack_metadata, pack_for_kernel
+from flash_mlm.host import flash_attn_mlm, flash_attn_mlm_compressed
+from flash_mlm.host.cache import InferenceCache
+from flash_mlm.host.host_utils import (
+    build_pack_metadata,
+    pack_for_kernel,
+    unpack_from_kernel,
+)
 
 
 def _resolve_padded_len(active_len: int, max_len: int | None, name: str) -> int:
@@ -79,6 +86,279 @@ def _measure_peak_cuda_memory_mb(fn, *, iters: int = 3) -> tuple[float, float]:
     return (
         max(0.0, float(peak_alloc - baseline_alloc) / mb),
         float(peak_reserved) / mb,
+    )
+
+
+def _bench_noncompressed(
+    *,
+    payload: dict,
+    is_mla: bool,
+    num_heads: int,
+    head_dim: int,
+    context_len_active: int,
+    context_batch_size: int,
+    block_m: int,
+    block_n: int,
+    auto_tune_tiles: bool,
+    check_correctness: bool,
+):
+    v_tensor = payload["k"] if is_mla else payload["v"]
+
+    inference_cache = InferenceCache()
+    if context_len_active > 0:
+        if is_mla:
+            k_cache_flat = payload["k_cache_dense"][:, 0, :context_len_active, :]
+            k_cache_flat = k_cache_flat.reshape(
+                context_batch_size * context_len_active, head_dim
+            )
+            v_cache_flat = None
+        else:
+            k_cache_flat = payload["k_cache_dense"][:, :, :context_len_active, :]
+            v_cache_flat = payload["v_cache_dense"][:, :, :context_len_active, :]
+            k_cache_flat = k_cache_flat.reshape(
+                context_batch_size * num_heads * context_len_active, head_dim
+            )
+            v_cache_flat = v_cache_flat.reshape(
+                context_batch_size * num_heads * context_len_active, head_dim
+            )
+
+        cu_seqlens_kv = torch.arange(
+            context_batch_size + 1, device=payload["q"].device, dtype=torch.int32
+        ) * int(context_len_active)
+        inference_cache.prefill_kv_cache(
+            layer_id=0,
+            k_cache=k_cache_flat,
+            v_cache=v_cache_flat,
+            total_context_len=int(context_batch_size * context_len_active),
+            cu_seqlens_kv=cu_seqlens_kv,
+            context_batch_size=context_batch_size,
+            is_mla=is_mla,
+            num_heads=num_heads,
+            head_dim=head_dim,
+        )
+
+    def _flash_fn():
+        return flash_attn_mlm(
+            payload["q"],
+            payload["k"],
+            v_tensor,
+            scale=payload["scale"],
+            inference_cache=inference_cache,
+            layer_id=0,
+            is_mla=is_mla,
+            context_batch_size=context_batch_size,
+            block_m=block_m,
+            block_n=block_n,
+            auto_tune_tiles=auto_tune_tiles,
+        )
+
+    def _torch_fn():
+        return _reference_dense_attention_with_cache(
+            payload["q"],
+            payload["k"],
+            v_tensor,
+            payload["k_cache_dense"],
+            payload["v_cache_dense"],
+            payload["lengths_q_dense"],
+            payload["lengths_kv_dense"],
+            payload["scale"],
+            is_mla,
+            context_batch_size,
+        )
+
+    def _sdpa_fn():
+        return _sdpa_dense_attention_with_cache(
+            payload["q"],
+            payload["k"],
+            v_tensor,
+            payload["k_cache_dense"],
+            payload["v_cache_dense"],
+            payload["lengths_q_dense"],
+            payload["lengths_kv_dense"],
+            payload["scale"],
+            is_mla,
+            context_batch_size,
+        )
+
+    if check_correctness:
+        torch.testing.assert_close(_flash_fn(), _torch_fn(), atol=2e-2, rtol=0)
+
+    flash_ms = triton.testing.do_bench(_flash_fn)
+    baseline_ms = triton.testing.do_bench(_torch_fn)
+    sdpa_ms = triton.testing.do_bench(_sdpa_fn)
+    flash_tflops = _estimate_tflops(
+        payload["lengths_q_dense"],
+        payload["lengths_kv_dense"],
+        num_heads,
+        head_dim,
+        flash_ms,
+    )
+    baseline_tflops = _estimate_tflops(
+        payload["lengths_q_dense"],
+        payload["lengths_kv_dense"],
+        num_heads,
+        head_dim,
+        baseline_ms,
+    )
+    sdpa_tflops = _estimate_tflops(
+        payload["lengths_q_dense"],
+        payload["lengths_kv_dense"],
+        num_heads,
+        head_dim,
+        sdpa_ms,
+    )
+
+    flash_peak_alloc_mb, flash_peak_reserved_mb = _measure_peak_cuda_memory_mb(
+        _flash_fn
+    )
+    baseline_peak_alloc_mb, baseline_peak_reserved_mb = _measure_peak_cuda_memory_mb(
+        _torch_fn
+    )
+    sdpa_peak_alloc_mb, sdpa_peak_reserved_mb = _measure_peak_cuda_memory_mb(_sdpa_fn)
+    return (
+        flash_ms,
+        baseline_ms,
+        sdpa_ms,
+        flash_tflops,
+        baseline_tflops,
+        sdpa_tflops,
+        flash_peak_alloc_mb,
+        flash_peak_reserved_mb,
+        baseline_peak_alloc_mb,
+        baseline_peak_reserved_mb,
+        sdpa_peak_alloc_mb,
+        sdpa_peak_reserved_mb,
+    )
+
+
+def _bench_compressed(
+    *,
+    payload: dict,
+    is_mla: bool,
+    num_heads: int,
+    head_dim: int,
+    context_batch_size: int,
+    block_m: int,
+    block_n: int,
+    auto_tune_tiles: bool,
+    check_correctness: bool,
+):
+    if is_mla:
+        k_cache = payload["k_cache_compact_mla"]
+        v_cache = None
+    else:
+        k_cache = payload["k_cache_compact"]
+        v_cache = payload["v_cache_compact"]
+
+    inference_cache = InferenceCache()
+    inference_cache.prefill_kv_cache(
+        layer_id=0,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        total_context_len=payload["total_context_len"],
+        cu_seqlens_kv=payload["cu_seqlens_kv"],
+        context_batch_size=context_batch_size,
+        is_mla=is_mla,
+        num_heads=num_heads,
+        head_dim=head_dim,
+    )
+
+    def _flash_fn():
+        return flash_attn_mlm_compressed(
+            payload["q"],
+            payload["k"],
+            payload["v"],
+            num_heads=num_heads,
+            q_meta=payload["q_meta"],
+            scale=payload["scale"],
+            inference_cache=inference_cache,
+            layer_id=0,
+            is_mla=is_mla,
+            context_batch_size=context_batch_size,
+            block_m=block_m,
+            block_n=block_n,
+            auto_tune_tiles=auto_tune_tiles,
+        )
+
+    def _torch_fn():
+        return _reference_varlen_attention_with_cache(
+            payload["q"],
+            payload["k"],
+            payload["v"],
+            payload["lengths_q_varlen"],
+            k_cache,
+            v_cache,
+            payload["cu_seqlens_kv"],
+            payload["scale"],
+            is_mla,
+            context_batch_size,
+        )
+
+    def _sdpa_fn():
+        return _sdpa_varlen_attention_with_cache(
+            payload["q"],
+            payload["k"],
+            payload["v"],
+            payload["lengths_q_varlen"],
+            k_cache,
+            v_cache,
+            payload["cu_seqlens_kv"],
+            payload["scale"],
+            is_mla,
+            context_batch_size,
+        )
+
+    if check_correctness:
+        packed_out = _flash_fn()
+        out = unpack_from_kernel(packed_out, payload["q_meta"], H=num_heads)
+        ref = _torch_fn()
+        torch.testing.assert_close(out, ref, atol=2e-2, rtol=0)
+
+    flash_ms = triton.testing.do_bench(_flash_fn)
+    baseline_ms = triton.testing.do_bench(_torch_fn)
+    sdpa_ms = triton.testing.do_bench(_sdpa_fn)
+    flash_tflops = _estimate_tflops(
+        payload["lengths_q_varlen"],
+        payload["lengths_kv_varlen"],
+        num_heads,
+        head_dim,
+        flash_ms,
+    )
+    baseline_tflops = _estimate_tflops(
+        payload["lengths_q_varlen"],
+        payload["lengths_kv_varlen"],
+        num_heads,
+        head_dim,
+        baseline_ms,
+    )
+    sdpa_tflops = _estimate_tflops(
+        payload["lengths_q_varlen"],
+        payload["lengths_kv_varlen"],
+        num_heads,
+        head_dim,
+        sdpa_ms,
+    )
+
+    flash_peak_alloc_mb, flash_peak_reserved_mb = _measure_peak_cuda_memory_mb(
+        _flash_fn
+    )
+    baseline_peak_alloc_mb, baseline_peak_reserved_mb = _measure_peak_cuda_memory_mb(
+        _torch_fn
+    )
+    sdpa_peak_alloc_mb, sdpa_peak_reserved_mb = _measure_peak_cuda_memory_mb(_sdpa_fn)
+    return (
+        flash_ms,
+        baseline_ms,
+        sdpa_ms,
+        flash_tflops,
+        baseline_tflops,
+        sdpa_tflops,
+        flash_peak_alloc_mb,
+        flash_peak_reserved_mb,
+        baseline_peak_alloc_mb,
+        baseline_peak_reserved_mb,
+        sdpa_peak_alloc_mb,
+        sdpa_peak_reserved_mb,
     )
 
 

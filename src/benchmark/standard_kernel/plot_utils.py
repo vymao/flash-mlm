@@ -27,7 +27,7 @@ def _plot_metric(
         [i - 1.5 * width for i in x],
         standard_vals,
         width=width,
-        label="Standard Attention",
+        label="Naive Attention",
     )
     ax.bar([i - 0.5 * width for i in x], sdpa_vals, width=width, label="PyTorch SDPA")
     ax.bar(
@@ -104,3 +104,61 @@ def write_benchmark_bar_plots(
         title=f"Attention peak reserved memory by section ({title_suffix})",
         out_path=plots_dir / "mlm-fourway-peak-reserved-mb.png",
     )
+
+
+def _section_plot_slug(section: str) -> str:
+    return (
+        section.lower()
+        .replace(" + ", "-")
+        .replace(" ", "-")
+        .replace("(", "")
+        .replace(")", "")
+    )
+
+
+def write_sequence_length_line_plots(
+    rows: list[dict],
+    *,
+    sections: list[str],
+    batch_size: int,
+    plots_dir: Path,
+):
+    method_specs = [
+        ("standard_ms", "Naive Attention", "o"),
+        ("sdpa_ms", "PyTorch SDPA", "s"),
+        ("noncompressed_ms", "Non-Compressed Kernel", "^"),
+        ("compressed_ms", "Compressed Kernel", "D"),
+    ]
+
+    for section in sections:
+        section_rows = sorted(
+            (row for row in rows if row["section"] == section),
+            key=lambda row: row["sequence_length"],
+        )
+        if not section_rows:
+            continue
+
+        seq_lengths = [row["sequence_length"] for row in section_rows]
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for key, label, marker in method_specs:
+            ax.plot(
+                seq_lengths,
+                [row[key] for row in section_rows],
+                marker=marker,
+                linewidth=2,
+                label=label,
+            )
+
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(seq_lengths)
+        ax.set_xticklabels([str(seq_len) for seq_len in seq_lengths])
+        ax.set_xlabel("Sequence length")
+        ax.set_ylabel("Latency (ms)")
+        ax.set_title(f"{section} latency vs sequence length (batch_size={batch_size})")
+        ax.grid(True, which="both", axis="y", alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        out_path = plots_dir / f"mlm-sequence-length-{_section_plot_slug(section)}.png"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=160)
+        plt.close(fig)

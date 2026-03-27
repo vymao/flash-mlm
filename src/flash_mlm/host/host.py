@@ -142,7 +142,7 @@ def flash_attn_mlm(
         desc_k = make_host_desc(k, y_dim, d)
         desc_v = make_host_desc(v, y_dim, d)
         desc_o = make_host_desc(out, y_dim, d)
-        if y_dim_context > 0:
+        if (not prefill) and y_dim_context > 0:
             desc_k_cache = make_host_desc(k_cache, y_dim_context, d)
             if is_mla:
                 desc_v_cache = desc_k_cache
@@ -451,7 +451,7 @@ def flash_attn_mlm_compressed(
         desc_k = make_host_desc(k, y_dim_kv_main, d)
         desc_v = make_host_desc(v, y_dim_kv_main, d)
         desc_o = make_host_desc(out, y_dim_q, d)
-        if y_dim_context > 0:
+        if (not prefill) and y_dim_context > 0:
             desc_k_cache = make_host_desc(k_cache, y_dim_context, d)
             if is_mla:
                 desc_v_cache = desc_k_cache
@@ -700,7 +700,7 @@ def flash_attn_mlm_precompressed(
         desc_k = make_host_desc(k, y_dim_kv_main, d)
         desc_v = make_host_desc(v, y_dim_kv_main, d)
         desc_o = make_host_desc(out, y_dim_q, d)
-        if y_dim_context > 0:
+        if (not prefill) and y_dim_context > 0:
             desc_k_cache = make_host_desc(k_cache, y_dim_context, d)
             if is_mla:
                 desc_v_cache = desc_k_cache

@@ -8,25 +8,10 @@ try:
 except ImportError:
     TensorDescriptor = None
 
-from flash_mlm.host.cache import InferenceCache
+from flash_mlm.host.cache import InferenceCache, PackMetadata
 
 if TYPE_CHECKING:
     from flash_mlm.host.cache import LayerKVEntry, PackingCache
-
-
-@dataclass
-class PackMetadata:
-    """Reusable metadata for fast pack/unpack across layers."""
-
-    B: int
-    N: int
-    lengths: torch.Tensor  # (B,) int tensor with active tokens per batch entry.
-    cu_seqlens: torch.Tensor  # (B+1) int tensor with cumulative sequence lengths.
-    token_indices: torch.Tensor  # (T,) Valid token indices.
-    total_tokens: int  # Total number of valid tokens.
-    batch_ids_block_n: int  # BLOCK_N
-    batch_ids_q: torch.Tensor  # (num_q_tiles,) tile-to-batch mapping
-    q_tile_starts_q: torch.Tensor  # (num_q_tiles,) packed query start offsets
 
 
 @dataclass

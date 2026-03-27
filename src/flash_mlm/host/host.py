@@ -9,7 +9,6 @@ except ImportError:
     _TRITON_AVAILABLE = False
 
 from flash_mlm.host.host_utils import (
-    PackMetadata,
     _maybe_get_cache_context,
     make_contiguous,
     make_host_desc,
@@ -21,7 +20,7 @@ from flash_mlm.host.host_utils import (
     validate_packed_cache_shapes,
     validate_qkv_same_shape_rank4,
 )
-from flash_mlm.host.cache import InferenceCache
+from flash_mlm.host.cache import InferenceCache, PackMetadata
 
 # Lazy imports for GPU-only kernel modules
 if _TRITON_AVAILABLE:

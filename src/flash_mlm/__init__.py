@@ -1,9 +1,8 @@
 import torch
 import warnings
 
-from flash_mlm.host.cache import InferenceCache, PackingCache
+from flash_mlm.host.cache import InferenceCache, PackMetadata, PackingCache
 from flash_mlm.host.host_utils import (
-    PackMetadata,
     build_pack_metadata,
     unpack_from_kernel,
 )

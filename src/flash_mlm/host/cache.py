@@ -1,10 +1,20 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
 import torch
 
-if TYPE_CHECKING:
-    from flash_mlm.host.host_utils import PackMetadata
+
+@dataclass
+class PackMetadata:
+    """Reusable metadata for fast pack/unpack across layers."""
+
+    B: int
+    N: int
+    lengths: torch.Tensor
+    cu_seqlens: torch.Tensor
+    token_indices: torch.Tensor
+    total_tokens: int
+    batch_ids_block_n: int
+    batch_ids_q: torch.Tensor
+    q_tile_starts_q: torch.Tensor
 
 
 class PackingCache:
@@ -15,7 +25,7 @@ class PackingCache:
             tuple[str, str, int | None, torch.dtype, int], torch.Tensor
         ] = {}
         self._pack_meta: dict[
-            tuple[str, int | None, int, int, tuple[int, ...]], "PackMetadata"
+            tuple[str, int | None, int, int, tuple[int, ...]], PackMetadata
         ] = {}
 
     def get_2d(
@@ -45,7 +55,7 @@ class PackingCache:
         *,
         N: int,
         block_n: int,
-    ) -> "PackMetadata":
+    ) -> PackMetadata:
         lengths_key = tuple(lengths.to(device="cpu", dtype=torch.int32).tolist())
         key = (lengths.device.type, lengths.device.index, N, block_n, lengths_key)
         meta = self._pack_meta.get(key)
